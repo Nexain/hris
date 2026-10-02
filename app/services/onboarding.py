@@ -2,7 +2,11 @@ import uuid
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from app.core.errors import ResourceNotFoundException, UnauthorizedAccessException
+from app.core.errors import (
+    DuplicateProfileException,
+    ResourceNotFoundException,
+    UnauthorizedAccessException,
+)
 from app.models.onboarding import (
     OnboardingProgress,
     OnboardingTask,
@@ -19,35 +23,49 @@ class OnboardingService:
     def __init__(self, firestore_repo: Optional[FirestoreRepository] = None):
         self.firestore_repo = firestore_repo or get_firestore_repository()
 
-    async def get_or_create_profile(
+    async def create_profile(
         self,
         user_id: str,
-        name: str = "Aji",
-        role: str = "Backend Engineer",
-        department: str = "Engineering",
-        location: str = "Jakarta",
+        name: str,
+        role: str,
+        department: str,
+        location: str,
     ) -> UserProfile:
-        """Fetch user profile or initialize profile with personalized onboarding tasks."""
+        """Explicitly create a new employee profile and generate their onboarding tasks.
+
+        Raises DuplicateProfileException if the profile already exists.
+        """
+        existing = await self.firestore_repo.get_user(user_id)
+        if existing:
+            raise DuplicateProfileException(user_id)
+
+        profile = UserProfile(
+            user_id=user_id,
+            name=name,
+            role=role,
+            department=department,
+            location=location,
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+        await self.firestore_repo.save_user(profile)
+        await self.generate_personalized_tasks(user_id, role, department, location)
+
+        return profile
+
+    async def get_profile(self, user_id: str) -> UserProfile:
+        """Fetch an existing user profile. Pure read — no side effects.
+
+        Raises ResourceNotFoundException if the profile does not exist.
+        """
         profile = await self.firestore_repo.get_user(user_id)
         if not profile:
-            profile = UserProfile(
-                user_id=user_id,
-                name=name,
-                role=role,
-                department=department,
-                location=location,
-                created_at=datetime.now(timezone.utc),
-                updated_at=datetime.now(timezone.utc),
-            )
-            await self.firestore_repo.save_user(profile)
-            # Generate default personalized tasks
-            await self.generate_personalized_tasks(user_id, role, department, location)
-
+            raise ResourceNotFoundException("UserProfile", user_id)
         return profile
 
     async def update_profile(self, user_id: str, updates: UserProfileUpdate) -> UserProfile:
         """Update employee profile fields."""
-        profile = await self.get_or_create_profile(user_id)
+        profile = await self.get_profile(user_id)
 
         if updates.name is not None:
             profile.name = updates.name
@@ -166,8 +184,11 @@ class OnboardingService:
         return tasks
 
     async def get_tasks(self, user_id: str) -> List[OnboardingTask]:
-        """Fetch all onboarding tasks for user (auto-creating if needed)."""
-        await self.get_or_create_profile(user_id)
+        """Fetch all onboarding tasks for user.
+
+        Raises ResourceNotFoundException if user profile does not exist.
+        """
+        await self.get_profile(user_id)
         return await self.firestore_repo.get_tasks(user_id)
 
     async def complete_task(self, user_id: str, task_id: str) -> OnboardingTask:

@@ -57,11 +57,7 @@ app.include_router(documents_router, prefix="/api/v1")
 app.include_router(onboarding_router, prefix="/api/v1")
 app.include_router(tasks_router, prefix="/api/v1")
 
-# Also mount at root for direct paths (/chat, /documents, /profile, /tasks, /onboarding/progress)
-app.include_router(chat_router)
-app.include_router(documents_router)
-app.include_router(onboarding_router)
-app.include_router(tasks_router)
+
 
 
 @app.get("/", tags=["System"])
