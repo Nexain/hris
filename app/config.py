@@ -1,29 +1,13 @@
-from functools import lru_cache
-from typing import Optional
-from pydantic_settings import BaseSettings, SettingsConfigDict
+"""Compatibility shim.
 
+The canonical configuration module is :mod:`app.core.config`. This module
+re-exports ``Settings`` and ``get_settings`` so that legacy imports
+(``from app.config import ...``) continue to work after the config was moved
+under ``app/core``.
+"""
 
-class Settings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-    )
+from app.core.config import Settings, get_settings
 
-    app_name: str = "FastAPI Vertex AI Gemini Bridge"
-    app_env: str = "development"
-    port: int = 8000
-    host: str = "0.0.0.0"
+__all__ = ["Settings", "get_settings"]
 
-    # Google Cloud Vertex AI Configuration
-    gcp_project_id: str = ""
-    gcp_location: str = "us-central1"
-    gemini_model: str = "gemini-1.5-flash"
-    google_application_credentials: Optional[str] = None
-
-
-@lru_cache()
-def get_settings() -> Settings:
-    """Return cached application settings."""
-    return Settings()
 

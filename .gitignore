@@ -21,6 +21,9 @@ dist/
 .coverage
 htmlcov/
 
+# Local fallback document storage (dev only; production uses Cloud Storage)
+data/
+
 # IDE & Editor files
 .vscode/
 .idea/

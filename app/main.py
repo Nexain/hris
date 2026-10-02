@@ -3,12 +3,17 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.chat import router as chat_router
+from app.api.documents import router as documents_router
+from app.api.onboarding import router as onboarding_router
+from app.api.tasks import router as tasks_router
 from app.config import get_settings
-from app.routers.chat import router as chat_router
+from app.core.errors import AppException, app_exception_handler
 
 # Configure logging
+settings = get_settings()
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, settings.log_level.upper(), logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("hris-api")
@@ -16,25 +21,26 @@ logger = logging.getLogger("hris-api")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    settings = get_settings()
+    curr_settings = get_settings()
     logger.info(
-        f"Starting {settings.app_name} in {settings.app_env} mode. "
-        f"Configured GCP Project: '{settings.gcp_project_id or '<not configured>'}', "
-        f"Location: '{settings.gcp_location}', "
-        f"Model: '{settings.gemini_model}'"
+        f"Starting {curr_settings.app_name} in {curr_settings.app_env} mode. "
+        f"GCP Project: '{curr_settings.gcp_project_id or '<local/unconfigured>'}', "
+        f"Location: '{curr_settings.gcp_location}', "
+        f"Gemini Model: '{curr_settings.gemini_model}'"
     )
     yield
-    logger.info(f"Shutting down {settings.app_name}")
+    logger.info(f"Shutting down {curr_settings.app_name}")
 
-
-settings = get_settings()
 
 app = FastAPI(
     title=settings.app_name,
     version="1.0.0",
-    description="FastAPI service acting as a bridge to communicate with Gemini in Google Cloud Vertex AI.",
+    description="DayOne AI Backend — AI Onboarding Copilot with Knowledge Base & Document Ingestion",
     lifespan=lifespan,
 )
+
+# Exception handlers
+app.add_exception_handler(AppException, app_exception_handler)
 
 # Enable CORS for cross-origin web clients
 app.add_middleware(
@@ -45,8 +51,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include Routers
+# Include Routers under /api/v1 (spec base path)
+app.include_router(chat_router, prefix="/api/v1")
+app.include_router(documents_router, prefix="/api/v1")
+app.include_router(onboarding_router, prefix="/api/v1")
+app.include_router(tasks_router, prefix="/api/v1")
+
+# Also mount at root for direct paths (/chat, /documents, /profile, /tasks, /onboarding/progress)
 app.include_router(chat_router)
+app.include_router(documents_router)
+app.include_router(onboarding_router)
+app.include_router(tasks_router)
 
 
 @app.get("/", tags=["System"])
@@ -56,14 +71,16 @@ async def root():
         "message": f"Welcome to {settings.app_name}",
         "docs_url": "/docs",
         "health_check": "/health",
+        "api_v1_base": "/api/v1",
     }
 
 
 @app.get("/health", tags=["System"])
+@app.get("/api/v1/health", tags=["System"])
 async def health_check():
     """Health check endpoint."""
     return {
-        "status": "healthy",
+        "status": "ok",
         "app_name": settings.app_name,
         "environment": settings.app_env,
         "gcp_location": settings.gcp_location,
