@@ -20,6 +20,14 @@ class UserProfile(BaseModel):
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
+class UserProfileCreate(BaseModel):
+    user_id: Optional[str] = None
+    name: str
+    role: str
+    department: str
+    location: str
+
+
 class UserProfileUpdate(BaseModel):
     name: Optional[str] = None
     role: Optional[str] = None

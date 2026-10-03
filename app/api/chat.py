@@ -122,7 +122,7 @@ async def chat_endpoint(
         )
 
     # 3. Handle COMPANY_KNOWLEDGE via RAG (Phase 3)
-    profile = await onboarding_service.get_or_create_profile(user_id)
+    profile = await onboarding_service.get_profile(user_id)
     answer, citations, grounded, escalation_required = await rag_engine.answer_question(
         question=message,
         user_id=user_id,

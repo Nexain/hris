@@ -30,6 +30,17 @@ class DuplicateDocumentException(AppException):
         )
 
 
+class DuplicateProfileException(AppException):
+    """Raised when attempting to create a profile that already exists."""
+
+    def __init__(self, user_id: str):
+        super().__init__(
+            code="DUPLICATE_PROFILE",
+            message=f"Profile for user '{user_id}' already exists.",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
 class ResourceNotFoundException(AppException):
     """Raised when a requested resource is not found."""
 
