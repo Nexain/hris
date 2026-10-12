@@ -1,3 +1,29 @@
+"""
+Documents API — Company Knowledge Base Management
+==================================================
+
+This module handles the full lifecycle of HR documents (policies, guides, SOPs)
+that feed the RAG (Retrieval-Augmented Generation) pipeline powering the AI chat.
+
+Document Lifecycle (must follow this order):
+--------------------------------------------
+  1. POST /documents                  → Create a logical document record (HR Admin only)
+  2. POST /documents/{id}/versions    → Upload a PDF file for that document
+  3. POST /versions/{id}/process      → Extract text, chunk it, and generate embeddings
+  4. GET  /versions/{id}/chunks       → (Optional) Inspect the chunks that were produced
+  5. GET  /versions/{id}/evaluation   → (Optional) Run quality check on retrieval accuracy
+  6. POST /versions/{id}/publish      → Make the version live so the chat AI can use it
+  7. POST /versions/{id}/reject       → Reject a version that failed review
+
+Key Concepts:
+-------------
+- A "Document" is a logical entry (e.g. "Leave Policy"). It can have many versions.
+- A "Version" is a specific PDF upload. Only ONE version can be PUBLISHED at a time.
+  When you publish a new version, the previous one becomes SUPERSEDED automatically.
+- The chat AI (RAG) only searches chunks from PUBLISHED versions. Drafts are invisible.
+- All write operations require HR_ADMIN role (pass header: X-Access-Level: HR_ADMIN).
+"""
+
 import re
 import uuid
 from datetime import datetime, timezone
@@ -60,7 +86,18 @@ async def create_document(
     current_user: UserContext = Depends(require_hr_admin),
     repo: FirestoreRepository = Depends(get_firestore_repository),
 ):
-    """Create a new logical document."""
+    """
+    STEP 1 of the document lifecycle — HR Admin creates a logical document entry.
+
+    This does NOT upload any file yet. It just registers the document's metadata
+    (title, type, department, location) in Firestore and assigns it a slug-based ID
+    (e.g. "Leave Policy" → "leave-policy").
+
+    After this, the HR Admin should upload a PDF using POST /documents/{id}/versions.
+    Every write action is recorded in the audit log for traceability.
+
+    Access: HR_ADMIN only.
+    """
     doc_id = slugify(doc_in.title)
     existing = await repo.get_document(doc_id)
     if existing:
@@ -105,7 +142,17 @@ async def list_documents(
     status: Optional[str] = Query(None, description="Filter by version status (e.g. PUBLISHED, REVIEW)"),
     repo: FirestoreRepository = Depends(get_firestore_repository),
 ):
-    """Retrieve filtered list of documents."""
+    """
+    Returns a filtered list of all logical documents in the knowledge base.
+
+    Each document in the response also includes its version history, so you can
+    see which versions are PUBLISHED, in REVIEW, SUPERSEDED, or REJECTED.
+
+    Useful for HR Admins to see what content is currently in the knowledge base,
+    and for debugging which documents are available to the chat AI (PUBLISHED only).
+
+    Access: Public (no auth required — read-only listing).
+    """
     doc_type_val = document_type.value if document_type else None
     return await repo.list_documents(
         department=department,
@@ -125,7 +172,15 @@ async def get_document(
     document_id: str,
     repo: FirestoreRepository = Depends(get_firestore_repository),
 ):
-    """Fetch logical document by ID."""
+    """
+    Returns the full details of a single document by its slug ID (e.g. "leave-policy").
+
+    The response includes all versions of the document and their statuses.
+    Use this to check the current state of a document before deciding to upload
+    a new version or publish an existing one.
+
+    Access: Public (no auth required — read-only).
+    """
     doc = await repo.get_document(document_id)
     if not doc:
         raise ResourceNotFoundException("Document", document_id)
@@ -146,7 +201,21 @@ async def upload_document_version(
     current_user: UserContext = Depends(require_hr_admin),
     processor: DocumentProcessor = Depends(get_document_processor),
 ):
-    """Upload and validate a new PDF document version."""
+    """
+    STEP 2 of the document lifecycle — Upload a PDF file as a new version of a document.
+
+    What this does:
+    - Validates the file is a non-empty PDF
+    - Computes a SHA-256 hash of the file bytes to detect exact duplicates
+    - Computes a SHA-256 hash of the extracted text to detect content duplicates (same content, different filename)
+    - Uploads the raw PDF to Google Cloud Storage
+    - Creates a DocumentVersion record in Firestore with status UPLOADED
+
+    After this step, the version is stored but NOT searchable yet.
+    The HR Admin must call POST /versions/{id}/process next to extract and embed the text.
+
+    Access: HR_ADMIN only.
+    """
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -190,7 +259,22 @@ async def process_version(
     current_user: UserContext = Depends(require_hr_admin),
     processor: DocumentProcessor = Depends(get_document_processor),
 ):
-    """Run full ingestion and chunking pipeline on uploaded version."""
+    """
+    STEP 3 of the document lifecycle — Run the full AI ingestion pipeline on a version.
+
+    What this does (in order):
+    1. Downloads the PDF from Cloud Storage
+    2. Extracts and normalizes the raw text
+    3. Splits the text into overlapping chunks (paragraphs/sections)
+    4. Generates a vector embedding for each chunk using Vertex AI Embeddings
+    5. Saves all chunks with their embeddings to Firestore
+    6. Moves the version status from UPLOADED → REVIEW
+
+    After this step, the version is ready to be reviewed and published.
+    The version is still NOT searchable by the chat AI until it is published.
+
+    Access: HR_ADMIN only.
+    """
     return await processor.process_version(version_id)
 
 
@@ -204,7 +288,18 @@ async def get_version_chunks(
     version_id: str,
     repo: FirestoreRepository = Depends(get_firestore_repository),
 ):
-    """Retrieve chunks belonging to a version."""
+    """
+    STEP 4 (Optional) — Inspect the text chunks generated from processing a version.
+
+    After calling POST /versions/{id}/process, the PDF is broken into text chunks.
+    This endpoint lets you read those chunks to verify the text was extracted correctly
+    before publishing the version.
+
+    Each chunk contains: the text content, its position index, section heading,
+    and the vector embedding used for similarity search.
+
+    Access: Public (read-only, useful for HR review and debugging).
+    """
     version = await repo.get_document_version(version_id)
     if not version:
         raise ResourceNotFoundException("DocumentVersion", version_id)
@@ -222,7 +317,22 @@ async def evaluate_version(
     repo: FirestoreRepository = Depends(get_firestore_repository),
     retrieval: RetrievalService = Depends(get_retrieval_service),
 ):
-    """Run regression evaluation for a version's chunks."""
+    """
+    STEP 5 (Optional) — Run a quality check on how well this version answers known questions.
+
+    Before publishing a new version, you can test whether the RAG retrieval actually
+    finds the right chunks when asked pre-defined "golden" questions. This helps catch
+    cases where text extraction went wrong or the content is poorly structured.
+
+    Metrics returned:
+    - hit_rate: % of questions where the correct chunk appeared in the top-K results
+    - mrr: Mean Reciprocal Rank (how high the correct chunk ranked on average)
+    - passed: True if hit_rate and mrr meet the minimum quality thresholds
+
+    Use this to make a data-driven decision before calling publish.
+
+    Access: Public (read-only evaluation, no data is modified).
+    """
     version = await repo.get_document_version(version_id)
     if not version:
         raise ResourceNotFoundException("DocumentVersion", version_id)
@@ -263,7 +373,22 @@ async def publish_version(
     current_user: UserContext = Depends(require_hr_admin),
     repo: FirestoreRepository = Depends(get_firestore_repository),
 ):
-    """Publish a document version."""
+    """
+    STEP 6 of the document lifecycle — Make a processed version live and searchable.
+
+    This is the final step. Once published:
+    - The version status changes to PUBLISHED
+    - Any previously PUBLISHED version of the same document becomes SUPERSEDED
+    - The document's current_version_id pointer is updated
+    - The chat AI (RAG) can now find and use this version's chunks to answer questions
+
+    Precondition: the version must be in REVIEW status (i.e. it has been processed).
+    You cannot publish a version that is still UPLOADED, already PUBLISHED, or REJECTED.
+
+    Every publish action is written to the audit log.
+
+    Access: HR_ADMIN only.
+    """
     target_version = await repo.get_document_version(version_id)
     if not target_version:
         raise ResourceNotFoundException("DocumentVersion", version_id)
@@ -321,7 +446,24 @@ async def reject_version(
     current_user: UserContext = Depends(require_hr_admin),
     repo: FirestoreRepository = Depends(get_firestore_repository),
 ):
-    """Reject a document version."""
+    """
+    STEP 6 (Alternative) — Reject a version instead of publishing it.
+
+    Use this when the processed version has quality issues (e.g. text extraction was
+    garbled, wrong file was uploaded, content failed the evaluation check).
+
+    A REJECTED version:
+    - Cannot be published or un-rejected
+    - Is permanently excluded from RAG search
+    - Remains in the version history for audit purposes
+
+    Restrictions: you cannot reject a version that is already PUBLISHED or SUPERSEDED.
+    To update a published document, upload a new version instead.
+
+    Every rejection is written to the audit log.
+
+    Access: HR_ADMIN only.
+    """
     target_version = await repo.get_document_version(version_id)
     if not target_version:
         raise ResourceNotFoundException("DocumentVersion", version_id)
