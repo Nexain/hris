@@ -385,3 +385,6 @@ without credentials.
 Real HRIS integration, payroll, leave approval workflows, salary database, SSO,
 native mobile apps, multi-company tenancy, GKE, Cloud SQL, BigQuery, Pub/Sub,
 API Gateway, microservices, and complex autonomous agent frameworks.
+
+Out-of-scope chat requests return a polite scope reminder, point the user back to
+HR for help, and mark the response for escalation when needed.

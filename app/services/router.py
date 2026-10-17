@@ -26,6 +26,17 @@ class ScopeRouter:
         r"\b(who\s+won\s+the|play\s+game|crypto|bitcoin)\b",
     ]
 
+    OUT_OF_SCOPE_MESSAGE = (
+        "That’s outside my scope as an onboarding assistant. I can help with company "
+        "policies, onboarding guides, and onboarding tasks. Please contact HR if you "
+        "need more help, and I can escalate it if needed."
+    )
+
+    SENSITIVE_MESSAGE = (
+        "I can’t help with confidential HR records or personal employee salary "
+        "information. Please contact HR if you need more help, and I can escalate it if needed."
+    )
+
     MY_ONBOARDING_PATTERNS = [
         r"\b(my\s+tasks?|my\s+checklist|my\s+onboarding|my\s+progress|what\s+should\s+i\s+do\s+next|next\s+step)\b",
         r"\b(my\s+profile|my\s+details|who\s+am\s+i)\b",
@@ -55,7 +66,7 @@ class ScopeRouter:
                 return (
                     IntentType.OUT_OF_SCOPE,
                     False,
-                    "I cannot access confidential HR records or personal employee salary information.",
+                    cls.SENSITIVE_MESSAGE,
                 )
 
         # 2. Scope Gate: Unrelated non-work prompts
@@ -64,7 +75,7 @@ class ScopeRouter:
                 return (
                     IntentType.OUT_OF_SCOPE,
                     False,
-                    "I am DayOne AI, your company onboarding copilot. I can only assist with company policies, onboarding guides, and your onboarding tasks.",
+                    cls.OUT_OF_SCOPE_MESSAGE,
                 )
 
         # 3. Onboarding Actions

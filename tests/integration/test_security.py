@@ -129,6 +129,8 @@ def test_sensitive_requests_are_rejected():
 def test_out_of_scope_requests_are_rejected():
     intent, allowed, reason = ScopeRouter.route("Tell me a joke about cats")
     assert allowed is False
+    assert "outside my scope" in reason.lower()
+    assert "hr" in reason.lower()
 
 
 @pytest.mark.asyncio
