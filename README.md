@@ -217,6 +217,16 @@ are used:
 }
 ```
 
+**Intent routing.** A regex check blocks sensitive questions first (other people's
+pay, private HR records). Then one short Gemini call with structured output picks the
+intent, so paraphrases and Indonesian work ("what's left for me", "apa tugas saya hari
+ini?"). If that call fails or takes longer than `INTENT_TIMEOUT_SECONDS`, the regex
+router decides. Questions about the user's own onboarding list every pending task.
+
+**No raw Gemini access.** Requests with `stream`, `system_instruction`, `model`,
+`temperature` or `max_output_tokens` get 403 unless `ENABLE_RAW_GEMINI_BRIDGE=true`
+and the caller is an HR admin.
+
 `citations` lists only the sources the answer used. A `user_id` in the body
 that differs from `X-User-Id` is refused with 403. Users without an onboarding
 profile (such as HR admins) can still ask company questions.
@@ -262,6 +272,19 @@ Publishing a version supersedes the previous live version and any older version
 that never went live (stuck in `PROCESSING`, `REVIEW`, or `FAILED`).
 Re-processing a published version (for example after a chunking fix) keeps it
 published.
+
+### Admin (HR admin)
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/admin/knowledge-base/reconcile` | Repair lifecycle data: keep the newest published version live, supersede older versions that never went live, fix `current_version_id`, and re-process live versions. `?dry_run=true` (default) only reports; `?reprocess=false` skips re-processing. |
+
+Run it once after a deploy that changes chunking or lifecycle rules:
+
+```bash
+curl -X POST "$API/api/v1/admin/knowledge-base/reconcile" -H "X-User-Id: hr_admin_001"                 # dry run
+curl -X POST "$API/api/v1/admin/knowledge-base/reconcile?dry_run=false" -H "X-User-Id: hr_admin_001"   # apply
+```
 
 ### Onboarding
 
@@ -393,6 +416,10 @@ The container:
 | `GOOGLE_APPLICATION_CREDENTIALS` | Optional service account key path |
 | `LOCAL_STORAGE_DIR` | Local fallback storage directory |
 | `HR_ADMIN_USER_IDS` | Comma-separated user IDs with HR admin rights (default `hr_admin_001`) |
+| `INTENT_CLASSIFIER_ENABLED` | Use Gemini to classify chat intent (default `true`) |
+| `INTENT_MODEL` | Model for intent classification (default: `GEMINI_MODEL`) |
+| `INTENT_TIMEOUT_SECONDS` | Fall back to regex routing after this many seconds (default `4`) |
+| `ENABLE_RAW_GEMINI_BRIDGE` | Allow HR admins raw, ungrounded Gemini on `/chat` (default `false`) |
 
 Never commit real secrets. Use `.env` locally and Cloud Run env vars / Secret
 Manager in production.

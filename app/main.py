@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.admin import router as admin_router
 from app.api.chat import router as chat_router
 from app.api.documents import router as documents_router
 from app.api.onboarding import router as onboarding_router
@@ -56,6 +57,7 @@ app.include_router(chat_router, prefix="/api/v1")
 app.include_router(documents_router, prefix="/api/v1")
 app.include_router(onboarding_router, prefix="/api/v1")
 app.include_router(tasks_router, prefix="/api/v1")
+app.include_router(admin_router, prefix="/api/v1")
 
 
 
