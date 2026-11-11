@@ -104,7 +104,10 @@ async def test_cross_user_task_access_is_forbidden(isolated_repos):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://test"
         ) as client:
-            # Seed user_001's tasks.
+            # Seed user_001's profile and tasks.
+            r = await client.post("/api/v1/profile", headers={"X-User-Id": "user_001"}, json={
+                "name": "Aji", "role": "Backend Engineer", "department": "Engineering", "location": "Jakarta"})
+            assert r.status_code == 201, r.text
             r = await client.get("/api/v1/tasks", headers={"X-User-Id": "user_001"})
             tasks = r.json()
             assert tasks

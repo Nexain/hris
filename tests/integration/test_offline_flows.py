@@ -72,6 +72,13 @@ def _client() -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
 
 
+async def _create_profile(client, user_id="user_001", role="Backend Engineer", department="Engineering"):
+    res = await client.post("/api/v1/profile", headers={"X-User-Id": user_id}, json={
+        "name": "Aji", "role": role, "department": department, "location": "Jakarta"})
+    assert res.status_code == 201, res.text
+    return res.json()
+
+
 async def _ingest(client, title, pages, publish=True):
     """Create -> upload -> process -> (optionally) publish a document."""
     res = await client.post("/api/v1/documents", headers=HR, json={"title": title, "document_type": "PROCEDURE"})
@@ -220,7 +227,7 @@ async def test_new_version_supersedes_previous(api):
         await client.post(f"/api/v1/versions/{v2}/process", headers=HR)
         await client.post(f"/api/v1/versions/{v2}/publish", headers=HR)
 
-        doc = (await client.get(f"/api/v1/documents/{doc_id}")).json()
+        doc = (await client.get(f"/api/v1/documents/{doc_id}", headers=HR)).json()
         assert doc["current_version_id"] == v2
         statuses = {v["id"]: v["status"] for v in doc["versions"]}
         assert statuses[v1] == "SUPERSEDED"
@@ -277,6 +284,7 @@ async def test_evaluation_questions_generated_and_persist(api):
 @pytest.mark.asyncio
 async def test_onboarding_profile_tasks_and_progress(api):
     async with _client() as client:
+        await _create_profile(client)
         profile = (await client.get("/api/v1/profile", headers=EMP)).json()
         assert profile["user_id"] == "user_001"
         assert profile["role"] == "Backend Engineer"
@@ -309,6 +317,7 @@ async def test_onboarding_profile_tasks_and_progress(api):
 @pytest.mark.asyncio
 async def test_security_boundaries(api):
     async with _client() as client:
+        await _create_profile(client)
         tasks = (await client.get("/api/v1/tasks", headers=EMP)).json()
 
         # Another employee cannot complete user_001's task.
@@ -345,11 +354,164 @@ async def test_list_and_filter_documents(api):
             "title": "Jakarta Benefits", "department": "People Operations", "location": "Jakarta"})
         assert res.status_code == 201
 
-        all_docs = (await client.get("/api/v1/documents")).json()
+        all_docs = (await client.get("/api/v1/documents", headers=HR)).json()
         assert len(all_docs) == 2
 
-        filtered = (await client.get("/api/v1/documents?location=Jakarta")).json()
+        # Employees only see documents that have a published version.
+        employee_docs = (await client.get("/api/v1/documents", headers=EMP)).json()
+        assert [d["id"] for d in employee_docs] == ["handbook"]
+
+        filtered = (await client.get("/api/v1/documents?location=Jakarta", headers=HR)).json()
         assert all(d["location"] == "Jakarta" for d in filtered)
 
         published = (await client.get("/api/v1/documents?status=PUBLISHED")).json()
         assert any(d["id"] == "handbook" for d in published)
+
+
+# ---------------------------------------------------------------- review fixes
+
+
+class CitingVertex:
+    """Fake Gemini that records requests and answers citing only [Source 1]."""
+
+    def __init__(self):
+        self.requests = []
+
+    async def generate_chat(self, request):  # noqa: ANN001
+        from app.schemas.chat import ChatResponse
+
+        self.requests.append(request)
+        return ChatResponse(response="You can carry over up to five days [Source 1].", model="fake")
+
+
+@pytest.mark.asyncio
+async def test_chat_works_without_profile(api):
+    """HR admins have no onboarding profile; chat must still answer, not 404."""
+    async with _client() as client:
+        await _ingest(client, "Leave Policy", [
+            "1. Annual Leave\nEmployees receive twelve days of annual leave each calendar year.",
+        ])
+        res = await client.post("/api/v1/chat", headers=HR, json={
+            "user_id": "hr_admin_001", "message": "How many days of annual leave do I get?"})
+        assert res.status_code == 200, res.text
+        assert res.json()["grounded"] is True
+
+        res = await client.post("/api/v1/chat", headers=HR, json={
+            "user_id": "hr_admin_001", "message": "What are my tasks?"})
+        assert res.status_code == 200, res.text
+        assert res.json()["intent"] == "MY_ONBOARDING"
+        assert "profile" in res.json()["answer"].lower()
+
+
+@pytest.mark.asyncio
+async def test_chat_refuses_other_user_id(api):
+    async with _client() as client:
+        res = await client.post("/api/v1/chat", headers=EMP, json={
+            "user_id": "user_002", "message": "What are my tasks?"})
+        assert res.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_follow_up_uses_history_and_only_cited_sources(api):
+    vertex = CitingVertex()
+    app.dependency_overrides[get_rag_engine] = lambda: RAGEngine(
+        retrieval_service=api["retrieval"], vertex_service=vertex)
+    async with _client() as client:
+        await _ingest(client, "Leave Policy", [
+            "1. Annual Leave\nEmployees receive twelve days of annual leave. Unused annual leave days "
+            "can be carried over to next year, up to five days.",
+        ])
+        await _ingest(client, "Benefit Guide", [
+            "1. Health Plan\nThe health plan covers outpatient visits and annual dental leave checkups.",
+        ])
+
+        res = await client.post("/api/v1/chat", headers=EMP, json={
+            "user_id": "user_001",
+            "message": "And can I carry it over?",
+            "history": [
+                {"role": "user", "content": "How many days of annual leave do I get?"},
+                {"role": "assistant", "content": "You get twelve days of annual leave."},
+                {"role": "bogus", "content": "ignored"},
+            ],
+        })
+        assert res.status_code == 200, res.text
+        body = res.json()
+        assert body["intent"] == "COMPANY_KNOWLEDGE"
+        assert body["grounded"] is True
+        # [Source N] markers are stripped from the answer text.
+        assert body["answer"] == "You can carry over up to five days."
+        # Only the cited source is returned, not every retrieved chunk.
+        assert [c["document_id"] for c in body["citations"]] == ["leave-policy"]
+
+        # Earlier turns are passed to Gemini with normalized roles.
+        sent = vertex.requests[-1]
+        assert [(m.role, m.content) for m in sent.history] == [
+            ("user", "How many days of annual leave do I get?"),
+            ("model", "You get twelve days of annual leave."),
+        ]
+
+
+@pytest.mark.asyncio
+async def test_employees_cannot_manage_or_see_unpublished_documents(api):
+    spoofed = {"X-User-Id": "user_002", "X-Access-Level": "HR_ADMIN"}
+    async with _client() as client:
+        # A client-supplied access level no longer grants HR rights.
+        res = await client.post("/api/v1/documents", headers=spoofed, json={"title": "Sneaky"})
+        assert res.status_code == 403
+        assert res.json()["error"]["code"] == "UNAUTHORIZED"
+
+        _, draft_version = await _ingest(client, "Draft Plan", [
+            "1. Draft\nThis plan is still being reviewed by HR."], publish=False)
+        _, live_version = await _ingest(client, "Live Guide", [
+            "1. Welcome\nWelcome to the company, here is the live guide."])
+
+        docs = (await client.get("/api/v1/documents", headers=spoofed)).json()
+        assert [d["id"] for d in docs] == ["live-guide"]
+        assert all(v["storage_path"] == "" and v["file_hash"] == "" for v in docs[0]["versions"])
+
+        assert (await client.get("/api/v1/documents/draft-plan", headers=EMP)).status_code == 404
+        assert (await client.get(f"/api/v1/versions/{draft_version}/chunks", headers=EMP)).status_code == 404
+        assert (await client.get(f"/api/v1/versions/{live_version}/chunks", headers=EMP)).status_code == 200
+        assert (await client.get(f"/api/v1/versions/{draft_version}/evaluation", headers=EMP)).status_code == 403
+
+        # HR still sees everything, including storage paths.
+        hr_docs = (await client.get("/api/v1/documents", headers=HR)).json()
+        assert {d["id"] for d in hr_docs} == {"draft-plan", "live-guide"}
+        assert all(v["storage_path"] for d in hr_docs for v in d["versions"])
+
+
+@pytest.mark.asyncio
+async def test_publish_supersedes_older_stuck_versions(api):
+    async with _client() as client:
+        res = await client.post("/api/v1/documents", headers=HR, json={"title": "Leave Policy"})
+        doc_id = res.json()["id"]
+
+        # v1 is uploaded but never processed, so it stays in PROCESSING.
+        res = await client.post(f"/api/v1/documents/{doc_id}/versions", headers=HR, files={
+            "file": ("v1.pdf", make_test_pdf(["1. Annual Leave\nTen days of leave."]), "application/pdf")})
+        stuck = res.json()["version_id"]
+
+        res = await client.post(f"/api/v1/documents/{doc_id}/versions", headers=HR, files={
+            "file": ("v2.pdf", make_test_pdf(["1. Annual Leave\nTwelve days of leave."]), "application/pdf")})
+        live = res.json()["version_id"]
+        await client.post(f"/api/v1/versions/{live}/process", headers=HR)
+        res = await client.post(f"/api/v1/versions/{live}/publish", headers=HR)
+        assert res.status_code == 200, res.text
+
+        doc = (await client.get(f"/api/v1/documents/{doc_id}", headers=HR)).json()
+        statuses = {v["id"]: v["status"] for v in doc["versions"]}
+        assert statuses == {stuck: "SUPERSEDED", live: "PUBLISHED"}
+
+
+@pytest.mark.asyncio
+async def test_reprocessing_published_version_keeps_it_live(api):
+    async with _client() as client:
+        doc_id, version_id = await _ingest(client, "Leave Policy", [
+            "1. Annual Leave\nEmployees receive twelve days of annual leave."])
+        res = await client.post(f"/api/v1/versions/{version_id}/process", headers=HR)
+        assert res.status_code == 200, res.text
+        assert res.json()["status"] == "PUBLISHED"
+
+        res = await client.post("/api/v1/chat", headers=EMP, json={
+            "user_id": "user_001", "message": "How many days of annual leave do I get?"})
+        assert res.json()["grounded"] is True

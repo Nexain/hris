@@ -41,6 +41,22 @@ from app.services.retrieval import RetrievalService, get_retrieval_service
 
 router = APIRouter(tags=["Documents"])
 
+# Versions an employee may see. Drafts, review copies, failures and rejections are
+# visible to HR admins only.
+EMPLOYEE_VISIBLE_STATUSES = {VersionStatus.PUBLISHED}
+
+
+def _employee_view(doc: Document) -> Optional[Document]:
+    """Strip a document down to what employees may see, or None if nothing is published."""
+    visible = [
+        v.model_copy(update={"storage_path": "", "file_hash": "", "content_hash": None, "error_message": None})
+        for v in doc.versions
+        if v.status in EMPLOYEE_VISIBLE_STATUSES
+    ]
+    if not visible:
+        return None
+    return doc.model_copy(update={"versions": visible})
+
 
 def slugify(text: str) -> str:
     """Generate a clean slug identifier from document title."""
@@ -103,16 +119,24 @@ async def list_documents(
     location: Optional[str] = Query(None, description="Filter by location"),
     document_type: Optional[DocumentType] = Query(None, description="Filter by document type"),
     status: Optional[str] = Query(None, description="Filter by version status (e.g. PUBLISHED, REVIEW)"),
+    current_user: UserContext = Depends(get_current_user),
     repo: FirestoreRepository = Depends(get_firestore_repository),
 ):
-    """Retrieve filtered list of documents."""
+    """Retrieve filtered list of documents.
+
+    HR admins see every version. Employees only see published versions, without
+    storage paths or hashes.
+    """
     doc_type_val = document_type.value if document_type else None
-    return await repo.list_documents(
+    docs = await repo.list_documents(
         department=department,
         location=location,
         document_type=doc_type_val,
         status=status,
     )
+    if current_user.is_hr_admin():
+        return docs
+    return [d for d in (_employee_view(doc) for doc in docs) if d is not None]
 
 
 @router.get(
@@ -123,13 +147,19 @@ async def list_documents(
 )
 async def get_document(
     document_id: str,
+    current_user: UserContext = Depends(get_current_user),
     repo: FirestoreRepository = Depends(get_firestore_repository),
 ):
     """Fetch logical document by ID."""
     doc = await repo.get_document(document_id)
     if not doc:
         raise ResourceNotFoundException("Document", document_id)
-    return doc
+    if current_user.is_hr_admin():
+        return doc
+    visible = _employee_view(doc)
+    if visible is None:
+        raise ResourceNotFoundException("Document", document_id)
+    return visible
 
 
 @router.post(
@@ -202,11 +232,14 @@ async def process_version(
 )
 async def get_version_chunks(
     version_id: str,
+    current_user: UserContext = Depends(get_current_user),
     repo: FirestoreRepository = Depends(get_firestore_repository),
 ):
-    """Retrieve chunks belonging to a version."""
+    """Retrieve chunks belonging to a version. Employees may only read published versions."""
     version = await repo.get_document_version(version_id)
-    if not version:
+    if not version or (
+        not current_user.is_hr_admin() and version.status not in EMPLOYEE_VISIBLE_STATUSES
+    ):
         raise ResourceNotFoundException("DocumentVersion", version_id)
     return await repo.get_chunks_by_version(version_id)
 
@@ -219,6 +252,7 @@ async def get_version_chunks(
 async def evaluate_version(
     version_id: str,
     top_k: int = Query(5, ge=1, le=20, description="Top-K for retrieval evaluation"),
+    current_user: UserContext = Depends(require_hr_admin),
     repo: FirestoreRepository = Depends(get_firestore_repository),
     retrieval: RetrievalService = Depends(get_retrieval_service),
 ):
@@ -281,12 +315,37 @@ async def publish_version(
     if not doc:
         raise ResourceNotFoundException("Document", target_version.document_id)
 
-    # Supersede previously published version if any
+    # Supersede the previously published version, plus any older version that never
+    # went live (stuck in PROCESSING, waiting in REVIEW, FAILED, ...). Leaving those
+    # behind shows stale "processing" entries next to the live version. Newer
+    # versions are left alone so a pending upload is not lost.
+    pending_statuses = {
+        VersionStatus.DRAFT,
+        VersionStatus.PROCESSING,
+        VersionStatus.FAILED,
+        VersionStatus.REVIEW,
+    }
     all_versions = await repo.get_document_versions(doc.id)
     for v in all_versions:
-        if v.id != version_id and v.status == VersionStatus.PUBLISHED:
+        if v.id == version_id:
+            continue
+        is_older_pending = v.status in pending_statuses and v.created_at < target_version.created_at
+        if v.status == VersionStatus.PUBLISHED or is_older_pending:
+            previous_state = v.status.value
             v.status = VersionStatus.SUPERSEDED
             await repo.update_document_version(v)
+            await repo.log_audit(
+                AuditLog(
+                    id=str(uuid.uuid4()),
+                    actor_id=current_user.user_id,
+                    action="SUPERSEDE_VERSION",
+                    resource_type="document_version",
+                    resource_id=v.id,
+                    previous_state=previous_state,
+                    new_state=VersionStatus.SUPERSEDED.value,
+                    metadata={"superseded_by": version_id},
+                )
+            )
 
     target_version.status = VersionStatus.PUBLISHED
     target_version.published_at = datetime.now(timezone.utc)

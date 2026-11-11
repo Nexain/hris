@@ -48,6 +48,13 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("GOOGLE_APPLICATION_CREDENTIALS", "google_application_credentials"),
     )
 
+    # Comma-separated user IDs that hold HR admin rights. The role is decided here on
+    # the server; the client-supplied X-Access-Level header can never grant it.
+    hr_admin_user_ids: str = Field(
+        default="hr_admin_001",
+        validation_alias=AliasChoices("HR_ADMIN_USER_IDS", "hr_admin_user_ids"),
+    )
+
     # Local fallback directory for documents when GCS is not configured
     local_storage_dir: str = Field(
         default="./data/storage",

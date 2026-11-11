@@ -131,6 +131,63 @@ class DocumentProcessor:
 
         return False
 
+    # Private-use glyphs that PDF exports often use for bullets (Symbol/Wingdings fonts).
+    _BULLET_GLYPHS = re.compile(r"^[•●▪‣⁃]\s*")
+    _PAGE_NUMBER_LINE = re.compile(r"^(page\s+)?\d+(\s*(/|of)\s*\d+)?$", re.IGNORECASE)
+    _NUMBERED_HEADING = re.compile(r"^\d+(\.\d+)*\.?\s+[A-Z][^\n]*$")
+
+    @classmethod
+    def is_strong_heading(cls, line: str) -> bool:
+        """Stricter heading check used for lines in the middle of a paragraph.
+
+        PDF text often comes out as one long paragraph per page, so headings sit
+        mid-paragraph. Only clear patterns count here ("3. Conflicts of Interest",
+        "# Title", "EMPLOYEE BENEFITS"); the loose title-case rule would misfire
+        on table cells.
+        """
+        line = line.strip()
+        if not line or len(line) > 80:
+            return False
+        if line.startswith("#"):
+            return True
+        if cls._NUMBERED_HEADING.match(line):
+            words = line.split()
+            return len(words) <= 9 and not line.endswith((".", ",", ";", ":"))
+        letters = [c for c in line if c.isalpha()]
+        return len(letters) >= 4 and line.isupper() and len(line) < 60
+
+    @classmethod
+    def strip_page_furniture(cls, pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Remove running headers/footers and page-number lines from each page.
+
+        A line counts as a running header/footer when it appears in the first or
+        last three lines of at least two pages (and of most pages). Without this,
+        a header like "Company - Internal HR Knowledge Base" is read as the
+        section heading of every chunk.
+        """
+        def edge_lines(text: str) -> List[str]:
+            lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+            return lines[:3] + lines[-3:]
+
+        counts: Dict[str, int] = {}
+        for p in pages:
+            for ln in set(edge_lines(p["text"])):
+                counts[ln] = counts.get(ln, 0) + 1
+
+        min_pages = max(2, (len(pages) + 1) // 2)
+        furniture = {ln for ln, n in counts.items() if n >= min_pages}
+
+        cleaned: List[Dict[str, Any]] = []
+        for p in pages:
+            kept = []
+            for ln in p["text"].split("\n"):
+                stripped = ln.strip()
+                if stripped in furniture or cls._PAGE_NUMBER_LINE.match(stripped):
+                    continue
+                kept.append(cls._BULLET_GLYPHS.sub("- ", stripped) if stripped else stripped)
+            cleaned.append({**p, "text": "\n".join(kept).strip()})
+        return cleaned
+
     def chunk_document(
         self,
         pages: List[Dict[str, Any]],
@@ -138,9 +195,14 @@ class DocumentProcessor:
         overlap_chars: int = 400,        # ~100 tokens
     ) -> List[Dict[str, Any]]:
         """Heading-aware chunking preserving section titles and page numbers."""
+        pages = self.strip_page_furniture(pages)
+
         # 1. Segment text into structured blocks with current heading
         blocks: List[Dict[str, Any]] = []
         current_section = "General"
+
+        def heading_text(line: str) -> str:
+            return re.sub(r"^#+\s*", "", line).strip()
 
         for p in pages:
             page_num = p["page"]
@@ -154,21 +216,29 @@ class DocumentProcessor:
                 # Check if paragraph is heading
                 lines = para.split("\n")
                 if len(lines) == 1 and self.is_likely_heading(lines[0]):
-                    current_section = re.sub(r"^#+\s*", "", lines[0]).strip()
+                    current_section = heading_text(lines[0])
                     continue
 
                 # Check if first line of paragraph is heading
                 if len(lines) > 1 and self.is_likely_heading(lines[0]):
-                    current_section = re.sub(r"^#+\s*", "", lines[0]).strip()
-                    para = "\n".join(lines[1:]).strip()
-                    if not para:
-                        continue
+                    current_section = heading_text(lines[0])
+                    lines = lines[1:]
 
-                blocks.append({
-                    "section": current_section,
-                    "page": page_num,
-                    "text": para,
-                })
+                # Split the rest of the paragraph at clear headings inside it.
+                buffer: List[str] = []
+                for line in lines:
+                    if self.is_strong_heading(line):
+                        text = "\n".join(buffer).strip()
+                        if text:
+                            blocks.append({"section": current_section, "page": page_num, "text": text})
+                        buffer = []
+                        current_section = heading_text(line)
+                    else:
+                        buffer.append(line)
+
+                text = "\n".join(buffer).strip()
+                if text:
+                    blocks.append({"section": current_section, "page": page_num, "text": text})
 
         if not blocks:
             return []
@@ -419,8 +489,12 @@ class DocumentProcessor:
             # 7. Generate/persist evaluation questions (once per document)
             eval_questions = await self.generate_evaluation_questions(document, chunks)
 
-            # 8. Update version status to REVIEW (automated validation passed, ready for HR review/publishing)
-            version.status = VersionStatus.REVIEW
+            # 8. Update version status to REVIEW (automated validation passed, ready for HR review/publishing).
+            # Re-processing a live or superseded version (e.g. after a chunking fix) keeps its status,
+            # so the published knowledge base does not drop out of search.
+            previous_status = version.status
+            if previous_status not in (VersionStatus.PUBLISHED, VersionStatus.SUPERSEDED):
+                version.status = VersionStatus.REVIEW
             version.chunk_count = len(chunks)
             version.processed_at = datetime.now(timezone.utc)
             await self.firestore_repo.update_document_version(version)
@@ -433,8 +507,8 @@ class DocumentProcessor:
                     action="PROCESS_VERSION",
                     resource_type="document_version",
                     resource_id=version_id,
-                    previous_state=VersionStatus.PROCESSING.value,
-                    new_state=VersionStatus.REVIEW.value,
+                    previous_state=previous_status.value,
+                    new_state=version.status.value,
                     metadata={"chunk_count": len(chunks), "evaluation_questions": len(eval_questions)},
                 )
             )
@@ -442,7 +516,7 @@ class DocumentProcessor:
             return DocumentProcessResponse(
                 document_id=version.document_id,
                 version_id=version.id,
-                status=VersionStatus.REVIEW,
+                status=version.status,
                 chunk_count=len(chunks),
                 chunks=chunks,
                 message="Document processed into searchable chunks successfully and ready for HR review.",
@@ -450,6 +524,11 @@ class DocumentProcessor:
 
         except Exception as e:
             logger.error(f"Processing version '{version_id}' failed: {e}")
+            if version.status in (VersionStatus.PUBLISHED, VersionStatus.SUPERSEDED):
+                # A failed re-process must not take a live version offline. Old chunks
+                # are only deleted after embeddings succeed, so they are still intact
+                # unless saving the new chunks failed.
+                raise DocumentProcessingException(f"Re-processing version failed: {str(e)}")
             version.status = VersionStatus.FAILED
             version.error_message = str(e)
             await self.firestore_repo.update_document_version(version)

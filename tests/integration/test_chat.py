@@ -49,7 +49,7 @@ async def test_chat_validation_empty_message():
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
-        response = await client.post("/chat", json={"message": ""})
+        response = await client.post("/api/v1/chat", json={"message": ""})
         assert response.status_code == 422
 
 
@@ -62,7 +62,7 @@ async def test_chat_missing_project_id_default():
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
         response = await client.post(
-            "/chat",
+            "/api/v1/chat",
             json={"message": "Hello, Gemini!"},
         )
         assert response.status_code == 500
@@ -86,7 +86,7 @@ async def test_chat_success_with_mock(mock_vertex_service):
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
         response = await client.post(
-            "/chat",
+            "/api/v1/chat",
             json={
                 "message": "Hello!",
                 "history": [
@@ -123,7 +123,7 @@ async def test_chat_streaming_with_mock(mock_vertex_service):
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
         response = await client.post(
-            "/chat",
+            "/api/v1/chat",
             json={
                 "message": "Tell me a story",
                 "stream": True,

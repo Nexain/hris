@@ -198,8 +198,28 @@ All endpoints are served under **both** the root path and `/api/v1`
 ```bash
 curl -X POST http://127.0.0.1:8000/api/v1/chat \
   -H "Content-Type: application/json" \
+  -H "X-User-Id: user_001" \
   -d '{"user_id": "user_001", "message": "How do I request a laptop?"}'
 ```
+
+Optional `history` carries earlier turns so follow-up questions work. Roles
+`user` and `model` (also `assistant` / `copilot`) are accepted; the last 6 turns
+are used:
+
+```json
+{
+  "user_id": "user_001",
+  "message": "And can I carry it over?",
+  "history": [
+    {"role": "user", "content": "How many days of annual leave do I get?"},
+    {"role": "model", "content": "You get twelve days of annual leave."}
+  ]
+}
+```
+
+`citations` lists only the sources the answer used. A `user_id` in the body
+that differs from `X-User-Id` is refused with 403. Users without an onboarding
+profile (such as HR admins) can still ask company questions.
 
 ```json
 {
@@ -233,7 +253,15 @@ curl -X POST http://127.0.0.1:8000/api/v1/chat \
 | `POST` | `/versions/{version_id}/publish` | Publish (supersedes previous) |
 | `POST` | `/versions/{version_id}/reject` | Reject a version |
 
-HR endpoints require an HR context. Pass `X-Access-Level: HR_ADMIN`.
+Write endpoints and `/evaluation` require an HR admin: an `X-User-Id` listed in
+`HR_ADMIN_USER_IDS` (default `hr_admin_001`). The `X-Access-Level` header is
+ignored. Other users get 403, and the read endpoints only show them published
+versions, without storage paths or hashes.
+
+Publishing a version supersedes the previous live version and any older version
+that never went live (stuck in `PROCESSING`, `REVIEW`, or `FAILED`).
+Re-processing a published version (for example after a chunking fix) keeps it
+published.
 
 ### Onboarding
 
@@ -284,8 +312,9 @@ Question → Scope Gate → Intent Router → Authorization → Query Embedding
 
 Authorization is enforced by the backend — never delegated to the model:
 
-1. Identify the user (`get_current_user`).
-2. Determine authorization (e.g. `require_hr_admin`).
+1. Identify the user (`get_current_user`, from `X-User-Id`).
+2. Determine authorization on the server (`require_hr_admin` checks the
+   `HR_ADMIN_USER_IDS` allowlist; client-sent access levels are ignored).
 3. Filter retrieved data (`PUBLISHED` only; soft department/location scoping).
 4. Build the Gemini context only from authorized information.
 5. Validate citations before returning.
@@ -293,6 +322,10 @@ Authorization is enforced by the backend — never delegated to the model:
 Employees may access published company documentation, their own profile, and
 their own tasks. Sensitive requests (e.g. another person's salary) are rejected
 and flagged for escalation.
+
+> **Limitation:** `X-User-Id` is still trusted as sent. The backend must only be
+> reachable through the frontend proxy, and that proxy should set `X-User-Id`
+> from an authenticated session rather than from the browser.
 
 ---
 
@@ -359,6 +392,7 @@ The container:
 | `FIRESTORE_DATABASE` | Firestore database name |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Optional service account key path |
 | `LOCAL_STORAGE_DIR` | Local fallback storage directory |
+| `HR_ADMIN_USER_IDS` | Comma-separated user IDs with HR admin rights (default `hr_admin_001`) |
 
 Never commit real secrets. Use `.env` locally and Cloud Run env vars / Secret
 Manager in production.
