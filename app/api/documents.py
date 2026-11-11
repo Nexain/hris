@@ -37,6 +37,7 @@ from app.services.document_processor import (
     get_document_processor,
 )
 from app.services.evaluation import RetrievalEvaluator
+from app.services.maintenance import supersede_replaced_versions
 from app.services.retrieval import RetrievalService, get_retrieval_service
 
 router = APIRouter(tags=["Documents"])
@@ -315,37 +316,8 @@ async def publish_version(
     if not doc:
         raise ResourceNotFoundException("Document", target_version.document_id)
 
-    # Supersede the previously published version, plus any older version that never
-    # went live (stuck in PROCESSING, waiting in REVIEW, FAILED, ...). Leaving those
-    # behind shows stale "processing" entries next to the live version. Newer
-    # versions are left alone so a pending upload is not lost.
-    pending_statuses = {
-        VersionStatus.DRAFT,
-        VersionStatus.PROCESSING,
-        VersionStatus.FAILED,
-        VersionStatus.REVIEW,
-    }
-    all_versions = await repo.get_document_versions(doc.id)
-    for v in all_versions:
-        if v.id == version_id:
-            continue
-        is_older_pending = v.status in pending_statuses and v.created_at < target_version.created_at
-        if v.status == VersionStatus.PUBLISHED or is_older_pending:
-            previous_state = v.status.value
-            v.status = VersionStatus.SUPERSEDED
-            await repo.update_document_version(v)
-            await repo.log_audit(
-                AuditLog(
-                    id=str(uuid.uuid4()),
-                    actor_id=current_user.user_id,
-                    action="SUPERSEDE_VERSION",
-                    resource_type="document_version",
-                    resource_id=v.id,
-                    previous_state=previous_state,
-                    new_state=VersionStatus.SUPERSEDED.value,
-                    metadata={"superseded_by": version_id},
-                )
-            )
+    # Supersede the previous live version and older versions that never went live.
+    await supersede_replaced_versions(repo, target_version, current_user.user_id)
 
     target_version.status = VersionStatus.PUBLISHED
     target_version.published_at = datetime.now(timezone.utc)

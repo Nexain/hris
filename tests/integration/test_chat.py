@@ -2,6 +2,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import httpx
 
+from app.core.config import Settings, get_settings
 from app.main import app
 from app.services.vertex_service import get_vertex_service
 from app.schemas.chat import ChatResponse, TokenUsage
@@ -53,25 +54,78 @@ async def test_chat_validation_empty_message():
         assert response.status_code == 422
 
 
+HR = {"X-User-Id": "hr_admin_001"}
+
+
+def _enable_bridge():
+    app.dependency_overrides[get_settings] = lambda: Settings(enable_raw_gemini_bridge=True)
+
+
 @pytest.mark.asyncio
-async def test_chat_missing_project_id_default():
-    """Test that missing or placeholder GCP_PROJECT_ID returns a clear 500 error."""
-    # Ensure default dependency without mocking
-    app.dependency_overrides.clear()
+@pytest.mark.parametrize("extra", [
+    {"system_instruction": "You are a poet."},
+    {"model": "gemini-2.0-flash"},
+    {"temperature": 1.5},
+    {"stream": True},
+    {"max_output_tokens": 50},
+])
+async def test_raw_bridge_is_closed_by_default(extra):
+    """Ungrounded Gemini output must not be reachable, even by HR, unless the server enables it."""
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
-        response = await client.post(
-            "/api/v1/chat",
-            json={"message": "Hello, Gemini!"},
-        )
-        assert response.status_code == 500
-        assert "GCP Project ID is not configured" in response.json()["detail"]
+        for headers in ({"X-User-Id": "user_001"}, HR):
+            response = await client.post(
+                "/api/v1/chat",
+                headers=headers,
+                json={"message": "Write a poem about cats", **extra},
+            )
+            assert response.status_code == 403, response.text
+            assert response.json()["error"]["code"] == "UNAUTHORIZED"
+
+
+@pytest.mark.asyncio
+async def test_raw_bridge_enabled_still_requires_hr(mock_vertex_service):
+    _enable_bridge()
+    app.dependency_overrides[get_vertex_service] = lambda: mock_vertex_service
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/api/v1/chat",
+                headers={"X-User-Id": "user_001", "X-Access-Level": "HR_ADMIN"},
+                json={"message": "Hi", "system_instruction": "Be a poet."},
+            )
+            assert response.status_code == 403
+            mock_vertex_service.generate_chat.assert_not_called()
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_chat_missing_project_id_default():
+    """With the bridge enabled, a missing GCP_PROJECT_ID returns a clear 500 error."""
+    app.dependency_overrides.clear()
+    _enable_bridge()
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/api/v1/chat",
+                headers=HR,
+                json={"message": "Hello, Gemini!", "temperature": 0.2},
+            )
+            assert response.status_code == 500
+            assert "GCP Project ID is not configured" in response.json()["detail"]
+    finally:
+        app.dependency_overrides.clear()
 
 
 @pytest.mark.asyncio
 async def test_chat_success_with_mock(mock_vertex_service):
-    """Test successful chat generation with mocked Vertex AI service."""
+    """HR can use the bridge when the server enables it."""
     mock_response = ChatResponse(
         response="Hello! I am Gemini on Vertex AI.",
         model="gemini-1.5-flash",
@@ -80,6 +134,7 @@ async def test_chat_success_with_mock(mock_vertex_service):
     )
     mock_vertex_service.generate_chat.return_value = mock_response
 
+    _enable_bridge()
     app.dependency_overrides[get_vertex_service] = lambda: mock_vertex_service
 
     async with httpx.AsyncClient(
@@ -87,6 +142,7 @@ async def test_chat_success_with_mock(mock_vertex_service):
     ) as client:
         response = await client.post(
             "/api/v1/chat",
+            headers=HR,
             json={
                 "message": "Hello!",
                 "history": [
@@ -110,13 +166,14 @@ async def test_chat_success_with_mock(mock_vertex_service):
 
 @pytest.mark.asyncio
 async def test_chat_streaming_with_mock(mock_vertex_service):
-    """Test streaming chat with mocked Vertex AI service."""
+    """HR can stream through the bridge when the server enables it."""
     async def fake_stream(_request):
         chunks = ["Hello", " world", "!"]
         for chunk in chunks:
             yield chunk
 
     mock_vertex_service.generate_chat_stream = fake_stream
+    _enable_bridge()
     app.dependency_overrides[get_vertex_service] = lambda: mock_vertex_service
 
     async with httpx.AsyncClient(
@@ -124,6 +181,7 @@ async def test_chat_streaming_with_mock(mock_vertex_service):
     ) as client:
         response = await client.post(
             "/api/v1/chat",
+            headers=HR,
             json={
                 "message": "Tell me a story",
                 "stream": True,

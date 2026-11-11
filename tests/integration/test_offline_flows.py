@@ -11,6 +11,7 @@ import pytest
 
 from app.core.config import Settings
 from app.main import app
+from app.models.document import VersionStatus
 from app.repositories.firestore import FirestoreRepository, get_firestore_repository
 from app.repositories.storage import StorageRepository, get_storage_repository
 from app.services.document_processor import DocumentProcessor, get_document_processor
@@ -515,3 +516,98 @@ async def test_reprocessing_published_version_keeps_it_live(api):
         res = await client.post("/api/v1/chat", headers=EMP, json={
             "user_id": "user_001", "message": "How many days of annual leave do I get?"})
         assert res.json()["grounded"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("question", ["what's left for me", "apa tugas saya hari ini?", "my checklist"])
+async def test_my_tasks_question_lists_pending_tasks(api, question):
+    async with _client() as client:
+        await _create_profile(client)
+        tasks = (await client.get("/api/v1/tasks", headers=EMP)).json()
+        await client.post(f"/api/v1/tasks/{tasks[0]['id']}/complete", headers=EMP)
+
+        res = await client.post("/api/v1/chat", headers=EMP, json={"user_id": "user_001", "message": question})
+        body = res.json()
+        assert body["intent"] == "MY_ONBOARDING", body
+        assert "You still have 6 tasks left" in body["answer"]
+        for task in tasks[1:]:
+            assert f"- Day {task['day']}: {task['title']}" in body["answer"]
+        assert tasks[0]["title"] not in body["answer"]
+
+
+# ---------------------------------------------------------------- reconcile
+
+
+async def _upload(client, doc_id, pages, name):
+    res = await client.post(f"/api/v1/documents/{doc_id}/versions", headers=HR, files={
+        "file": (name, make_test_pdf(pages), "application/pdf")})
+    assert res.status_code == 201, res.text
+    return res.json()["version_id"]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_repairs_legacy_lifecycle_data(api):
+    firestore = api["firestore"]
+    header = "DayOne AI - Internal HR Knowledge Base"
+    async with _client() as client:
+        # Leave policy as it is in production: v1 stuck in PROCESSING, v2 published,
+        # current_version_id null, and chunks carrying the page header as section.
+        doc_id = (await client.post("/api/v1/documents", headers=HR, json={"title": "Leave Policy"})).json()["id"]
+        stuck = await _upload(client, doc_id, ["1. Annual Leave\nTen days."], "v1.pdf")
+        live = await _upload(client, doc_id, [
+            f"{header}\nPage 1\n1. Annual Leave\nEmployees receive twelve days of annual leave.",
+            f"{header}\nPage 2\n2. Sick Leave\nSick leave needs a doctor's note after two days.",
+        ], "v2.pdf")
+        await client.post(f"/api/v1/versions/{live}/process", headers=HR)
+        v = await firestore.get_document_version(live)
+        v.status = VersionStatus.PUBLISHED
+        await firestore.update_document_version(v)
+        for chunk in await firestore.get_chunks_by_version(live):
+            chunk.section = header
+            await firestore.save_chunks([chunk])
+
+        # A second document with two PUBLISHED versions and a stale current_version_id.
+        _, old_live = await _ingest(client, "Benefit Guide", ["1. Health\nOutpatient visits are covered."])
+        new_live = await _upload(client, "benefit-guide", ["1. Health\nOutpatient and dental visits are covered."], "b2.pdf")
+        await client.post(f"/api/v1/versions/{new_live}/process", headers=HR)
+        v = await firestore.get_document_version(new_live)
+        v.status = VersionStatus.PUBLISHED
+        await firestore.update_document_version(v)
+
+        # Employees cannot run it.
+        res = await client.post("/api/v1/admin/knowledge-base/reconcile", headers=EMP)
+        assert res.status_code == 403
+
+        # Dry run reports but changes nothing.
+        res = await client.post("/api/v1/admin/knowledge-base/reconcile", headers=HR)
+        assert res.status_code == 200, res.text
+        dry = res.json()
+        assert dry["dry_run"] is True
+        assert dry["versions_superseded"] == 2
+        assert dry["current_version_ids_fixed"] == 2
+        assert (await firestore.get_document_version(stuck)).status == VersionStatus.PROCESSING
+
+        res = await client.post("/api/v1/admin/knowledge-base/reconcile?dry_run=false", headers=HR)
+        assert res.status_code == 200, res.text
+        report = res.json()
+        assert report["versions_reprocessed"] == 2 and report["reprocess_errors"] == 0
+
+        leave = (await client.get(f"/api/v1/documents/{doc_id}", headers=HR)).json()
+        assert leave["current_version_id"] == live
+        assert {v["id"]: v["status"] for v in leave["versions"]} == {stuck: "SUPERSEDED", live: "PUBLISHED"}
+
+        benefit = (await client.get("/api/v1/documents/benefit-guide", headers=HR)).json()
+        assert benefit["current_version_id"] == new_live
+        assert {v["id"]: v["status"] for v in benefit["versions"]} == {old_live: "SUPERSEDED", new_live: "PUBLISHED"}
+
+        # Live chunks were rebuilt with real headings and no page furniture.
+        chunks = await firestore.get_chunks_by_version(live)
+        assert [c.section for c in chunks] == ["1. Annual Leave", "2. Sick Leave"]
+        assert all(header not in c.content and "Page " not in c.content for c in chunks)
+        leave_report = next(d for d in report["documents"] if d["document_id"] == doc_id)
+        assert leave_report["reprocessed"][0]["sections"] == ["1. Annual Leave", "2. Sick Leave"]
+
+        # Running again finds nothing left to fix.
+        again = (await client.post(
+            "/api/v1/admin/knowledge-base/reconcile?dry_run=false&reprocess=false", headers=HR)).json()
+        assert again["documents_changed"] == 0

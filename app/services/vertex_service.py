@@ -1,6 +1,7 @@
+import json
 import logging
 import os
-from typing import AsyncIterator, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional
 
 from fastapi import HTTPException, status
 from google import genai
@@ -169,6 +170,50 @@ class VertexGeminiService:
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Failed to generate response from Gemini: {str(e)}",
             )
+
+    @staticmethod
+    def _fast_thinking_config(model: str) -> Optional[types.ThinkingConfig]:
+        """Smallest thinking setting the model supports, for short classification calls."""
+        name = model.lower()
+        if "gemini-3" in name:
+            return types.ThinkingConfig(thinking_level=types.ThinkingLevel.MINIMAL)
+        if "gemini-2.5-flash" in name:
+            return types.ThinkingConfig(thinking_budget=0)
+        return None
+
+    async def generate_json(
+        self,
+        prompt: str,
+        response_schema: types.Schema,
+        system_instruction: Optional[str] = None,
+        history: Optional[List[ChatMessage]] = None,
+        model: Optional[str] = None,
+        max_output_tokens: int = 256,
+    ) -> Dict[str, Any]:
+        """Run a short structured-output call and return the parsed JSON object.
+
+        Errors are raised as-is so callers can fall back to a non-LLM path.
+        """
+        target_model = model or self.settings.gemini_model
+        # Gemini 3 is tuned for its default temperature; lowering it can cause loops.
+        temperature = None if "gemini-3" in target_model.lower() else 0.0
+        config = types.GenerateContentConfig(
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+            response_mime_type="application/json",
+            response_schema=response_schema,
+            system_instruction=system_instruction,
+            thinking_config=self._fast_thinking_config(target_model),
+        )
+        response = await self.client.aio.models.generate_content(
+            model=target_model,
+            contents=self._build_contents(prompt, history),
+            config=config,
+        )
+        parsed = json.loads(response.text or "{}")
+        if not isinstance(parsed, dict):
+            raise ValueError(f"Expected a JSON object, got {type(parsed).__name__}")
+        return parsed
 
     async def generate_chat_stream(
         self, request: ChatRequest

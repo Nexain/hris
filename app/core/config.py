@@ -55,6 +55,25 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("HR_ADMIN_USER_IDS", "hr_admin_user_ids"),
     )
 
+    # Intent classification: one short Gemini call per chat message, with the regex
+    # router as fallback. INTENT_MODEL defaults to GEMINI_MODEL when empty.
+    intent_classifier_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("INTENT_CLASSIFIER_ENABLED", "intent_classifier_enabled"),
+    )
+    intent_model: str = Field(default="", validation_alias=AliasChoices("INTENT_MODEL", "intent_model"))
+    intent_timeout_seconds: float = Field(
+        default=4.0,
+        validation_alias=AliasChoices("INTENT_TIMEOUT_SECONDS", "intent_timeout_seconds"),
+    )
+
+    # The raw, ungrounded Gemini bridge on /chat (system_instruction, model, stream, ...).
+    # Off by default; when on, only HR admins may use it.
+    enable_raw_gemini_bridge: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("ENABLE_RAW_GEMINI_BRIDGE", "enable_raw_gemini_bridge"),
+    )
+
     # Local fallback directory for documents when GCS is not configured
     local_storage_dir: str = Field(
         default="./data/storage",
