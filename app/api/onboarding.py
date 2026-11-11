@@ -1,9 +1,11 @@
 from fastapi import APIRouter, Depends, status
 
-from app.core.security import UserContext, get_current_user
+from app.core.errors import ResourceNotFoundException
+from app.core.security import AccessLevel, UserContext, get_current_user
 from app.models.onboarding import (
     OnboardingProgress,
     UserProfile,
+    UserProfileResponse,
     UserProfileCreate,
     UserProfileUpdate,
 )
@@ -36,16 +38,36 @@ async def create_profile(
 
 @router.get(
     "/profile",
-    response_model=UserProfile,
+    response_model=UserProfileResponse,
     summary="Get current user profile",
-    description="Retrieve the employee's onboarding profile. Returns 404 if not registered.",
+    description=(
+        "Retrieve the caller's onboarding profile with `is_hr`, decided by the server's "
+        "HR_ADMIN_USER_IDS. HR admins without a stored profile get a default HR profile; "
+        "other users without one get 404."
+    ),
 )
 async def get_profile(
     current_user: UserContext = Depends(get_current_user),
     service: OnboardingService = Depends(get_onboarding_service),
 ):
-    """Retrieve profile for the authenticated employee."""
-    return await service.get_profile(user_id=current_user.user_id)
+    """Retrieve profile for the authenticated user."""
+    is_hr = current_user.is_hr_admin()
+    try:
+        profile = await service.get_profile(user_id=current_user.user_id)
+    except ResourceNotFoundException:
+        if not is_hr:
+            raise
+        # HR admins don't go through onboarding, so they usually have no stored profile.
+        profile = UserProfile(
+            user_id=current_user.user_id,
+            name=current_user.name,
+            role=current_user.role,
+            department=current_user.department,
+            location=current_user.location,
+        )
+
+    access_level = AccessLevel.HR_ADMIN.value if is_hr else AccessLevel.EMPLOYEE.value
+    return UserProfileResponse(**profile.model_dump(exclude={"access_level"}), access_level=access_level, is_hr=is_hr)
 
 
 @router.put(

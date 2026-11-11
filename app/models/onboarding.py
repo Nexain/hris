@@ -20,6 +20,25 @@ class UserProfile(BaseModel):
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
+class UserProfileResponse(UserProfile):
+    """Profile as returned by GET /profile, plus the server-decided HR flag."""
+
+    is_hr: bool = False
+
+
+class EmployeeSummary(BaseModel):
+    """One row of the HR onboarding monitor."""
+
+    user_id: str
+    name: str
+    role: str
+    department: str
+    location: str
+    progress_percent: float
+    completed: int
+    total: int
+
+
 class UserProfileCreate(BaseModel):
     user_id: Optional[str] = None
     name: str

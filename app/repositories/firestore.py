@@ -331,6 +331,12 @@ class FirestoreRepository:
             data = self._mem_users.get(user_id)
             return UserProfile(**data) if data else None
 
+    async def list_users(self) -> List[UserProfile]:
+        """Fetch every stored user profile."""
+        if self.client:
+            return [UserProfile(**snap.to_dict()) for snap in self.client.collection("users").stream()]
+        return [UserProfile(**data) for data in self._mem_users.values()]
+
     async def save_user(self, user: UserProfile) -> UserProfile:
         """Create or update a user profile."""
         data = user.model_dump(mode="json")

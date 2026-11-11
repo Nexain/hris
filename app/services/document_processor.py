@@ -524,8 +524,9 @@ class DocumentProcessor:
 
         except Exception as e:
             logger.error(f"Processing version '{version_id}' failed: {e}")
-            if version.status in (VersionStatus.PUBLISHED, VersionStatus.SUPERSEDED):
-                # A failed re-process must not take a live version offline. Old chunks
+            if version.status in (VersionStatus.PUBLISHED, VersionStatus.SUPERSEDED, VersionStatus.REVIEW):
+                # A failed re-process must not take a live version offline, or drop a
+                # reviewed draft out of the review queue. Old chunks
                 # are only deleted after embeddings succeed, so they are still intact
                 # unless saving the new chunks failed.
                 raise DocumentProcessingException(f"Re-processing version failed: {str(e)}")

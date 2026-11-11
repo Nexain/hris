@@ -52,6 +52,17 @@ class ResourceNotFoundException(AppException):
         )
 
 
+class UnauthenticatedException(AppException):
+    """Raised when the request does not identify a user."""
+
+    def __init__(self, message: str = "Missing user identity."):
+        super().__init__(
+            code="UNAUTHENTICATED",
+            message=message,
+            status_code=status.HTTP_401_UNAUTHORIZED,
+        )
+
+
 class UnauthorizedAccessException(AppException):
     """Raised when an operation is unauthorized."""
 
