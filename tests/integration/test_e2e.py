@@ -191,7 +191,10 @@ async def test_end_to_end_journey(e2e):
         "user_id": "user_001", "message": "What is the onboarding process?"})
     assert res.json()["intent"] == "GENERAL_ONBOARDING"
 
-    # 9. Personalized tasks + progress.
+    # 9. Personalized tasks + progress (profiles are created explicitly).
+    res = await client.post("/api/v1/profile", headers=EMP, json={
+        "name": "Aji", "role": "Backend Engineer", "department": "Engineering", "location": "Jakarta"})
+    assert res.status_code == 201, res.text
     tasks = (await client.get("/api/v1/tasks", headers=EMP)).json()
     assert len(tasks) == 7
     res = await client.post(f"/api/v1/tasks/{tasks[0]['id']}/complete", headers=EMP)
@@ -210,7 +213,7 @@ async def test_end_to_end_journey(e2e):
     await client.post(f"/api/v1/versions/{v2}/process", headers=HR)
     await client.post(f"/api/v1/versions/{v2}/publish", headers=HR)
 
-    doc = (await client.get(f"/api/v1/documents/{doc_id}")).json()
+    doc = (await client.get(f"/api/v1/documents/{doc_id}", headers=HR)).json()
     statuses = {v["id"]: v["status"] for v in doc["versions"]}
     assert statuses[v1] == "SUPERSEDED"
     assert statuses[v2] == "PUBLISHED"

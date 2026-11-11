@@ -1,13 +1,15 @@
 import json
 import logging
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from fastapi import APIRouter, Depends, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from app.core.errors import ResourceNotFoundException, UnauthorizedAccessException
 from app.core.security import UserContext, get_current_user
 from app.models.chat import ChatRequestV1, ChatResponseV1, IntentType
 from app.models.onboarding import TaskStatus
+from app.schemas.chat import ChatMessage
 from app.services.gemini import RAGEngine, get_rag_engine
 from app.services.onboarding import OnboardingService, get_onboarding_service
 from app.services.router import ScopeRouter
@@ -16,6 +18,24 @@ from app.services.vertex_service import VertexGeminiService, get_vertex_service
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Chat"])
+
+# Roles the frontend may use for earlier turns, mapped to the model's roles.
+_HISTORY_ROLES = {"user": "user", "employee": "user", "model": "model", "assistant": "model", "copilot": "model", "bot": "model"}
+
+
+def _parse_history(raw: Any) -> List[ChatMessage]:
+    """Leniently read earlier chat turns from the request; unknown entries are skipped."""
+    if not isinstance(raw, list):
+        return []
+    history: List[ChatMessage] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        role = _HISTORY_ROLES.get(str(item.get("role") or item.get("sender") or "").lower())
+        content = item.get("content")
+        if role and isinstance(content, str) and content.strip():
+            history.append(ChatMessage(role=role, content=content))
+    return history
 
 
 @router.post(
@@ -43,7 +63,9 @@ async def chat_endpoint(
         )
 
     # If stream or legacy bridge parameters without user_id, route to raw Vertex Gemini service
-    if body.get("stream", False) or ("user_id" not in body and ("history" in body or "system_instruction" in body or "model" in body or "temperature" in body or message == "Hello, Gemini!")):
+    # Earlier turns ("history") alone do not select this path: a grounded chat request
+    # that carries history must still go through the document search below.
+    if body.get("stream", False) or ("user_id" not in body and ("system_instruction" in body or "model" in body or "temperature" in body or message == "Hello, Gemini!")):
         from app.schemas.chat import ChatRequest
         stream_req = ChatRequest(**body)
 
@@ -71,7 +93,14 @@ async def chat_endpoint(
             return JSONResponse(content=result.model_dump(mode="json"))
         return JSONResponse(content=result)
 
-    user_id = body.get("user_id") or current_user.user_id
+    # The caller's identity comes from the request headers. A different user_id in the
+    # body is refused, so one employee cannot read another's onboarding data.
+    user_id = current_user.user_id
+    body_user_id = body.get("user_id")
+    if body_user_id and body_user_id != user_id:
+        raise UnauthorizedAccessException("You can only chat as yourself.")
+
+    history = _parse_history(body.get("history"))
 
     # 1. Scope Gate & Intent Routing (Phase 5)
     intent, is_allowed, fallback_reason = ScopeRouter.route(message)
@@ -91,11 +120,16 @@ async def chat_endpoint(
         IntentType.ONBOARDING_ACTION,
         IntentType.GENERAL_ONBOARDING,
     ):
-        tasks = await onboarding_service.get_tasks(user_id)
-        progress = await onboarding_service.get_progress(user_id)
+        try:
+            tasks = await onboarding_service.get_tasks(user_id)
+            progress = await onboarding_service.get_progress(user_id)
+        except ResourceNotFoundException:
+            tasks, progress = [], None
         pending = [t for t in tasks if t.status == TaskStatus.PENDING]
 
-        if not tasks:
+        if progress is None:
+            answer = "You don't have an onboarding profile yet, so there are no onboarding tasks to show."
+        elif not tasks:
             answer = "You currently have no onboarding tasks assigned."
         elif not pending:
             answer = f"Congratulations! You have completed all {progress.total} onboarding tasks (100% complete)!"
@@ -122,12 +156,20 @@ async def chat_endpoint(
         )
 
     # 3. Handle COMPANY_KNOWLEDGE via RAG (Phase 3)
-    profile = await onboarding_service.get_profile(user_id)
+    # Users without an onboarding profile (e.g. HR admins testing policies) can still
+    # ask company questions; fall back to the department/location from the request.
+    try:
+        profile = await onboarding_service.get_profile(user_id)
+        department, location = profile.department, profile.location
+    except ResourceNotFoundException:
+        department, location = current_user.department, current_user.location
+
     answer, citations, grounded, escalation_required = await rag_engine.answer_question(
         question=message,
         user_id=user_id,
-        department=profile.department,
-        location=profile.location,
+        department=department,
+        location=location,
+        history=history,
     )
 
     return ChatResponseV1(

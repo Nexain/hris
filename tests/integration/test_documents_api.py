@@ -9,6 +9,8 @@ from app.repositories.storage import StorageRepository, get_storage_repository
 from app.services.document_processor import DocumentProcessor, get_document_processor
 from tests.conftest import make_test_pdf
 
+HR = {"X-User-Id": "hr_admin_001"}
+
 
 @pytest.fixture(autouse=True)
 def clean_app_dependencies(tmp_path):
@@ -34,7 +36,7 @@ def clean_app_dependencies(tmp_path):
 @pytest.mark.asyncio
 async def test_create_and_list_documents():
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://test"
+        transport=httpx.ASGITransport(app=app), base_url="http://test", headers=HR
     ) as client:
         # 1. Create document
         res = await client.post(
@@ -72,7 +74,7 @@ async def test_create_and_list_documents():
 @pytest.mark.asyncio
 async def test_get_document_by_id():
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://test"
+        transport=httpx.ASGITransport(app=app), base_url="http://test", headers=HR
     ) as client:
         # Create
         await client.post(
@@ -96,7 +98,7 @@ async def test_get_document_by_id():
 @pytest.mark.asyncio
 async def test_upload_and_process_pdf_lifecycle(sample_pdf_bytes):
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://test"
+        transport=httpx.ASGITransport(app=app), base_url="http://test", headers=HR
     ) as client:
         # 1. Create document
         doc_res = await client.post(
@@ -150,7 +152,7 @@ async def test_upload_and_process_pdf_lifecycle(sample_pdf_bytes):
 @pytest.mark.asyncio
 async def test_duplicate_upload_rejection_api(sample_pdf_bytes):
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://test"
+        transport=httpx.ASGITransport(app=app), base_url="http://test", headers=HR
     ) as client:
         # Create doc
         await client.post(
@@ -179,7 +181,7 @@ async def test_duplicate_upload_rejection_api(sample_pdf_bytes):
 @pytest.mark.asyncio
 async def test_reject_version_api(sample_pdf_bytes):
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://test"
+        transport=httpx.ASGITransport(app=app), base_url="http://test", headers=HR
     ) as client:
         await client.post(
             "/api/v1/documents",

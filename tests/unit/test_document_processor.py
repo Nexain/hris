@@ -178,3 +178,37 @@ async def test_duplicate_content_detection(isolated_processor):
             version_str="1.1",
         )
     assert "Duplicate content detected" in str(exc_info.value)
+
+
+def test_running_header_is_not_used_as_section():
+    """Real HR PDFs repeat a header on every page and put headings mid-paragraph."""
+    header = "DayOne AI - Internal HR Knowledge Base"
+    pages = [
+        {"page": 1, "text": f"{header}\nPage 1\nBenefits Guide\nOwner: People Operations | Version: 1.3\n"
+                            "1. Benefits at a Glance\nEmployees are enrolled in the health plan.\n"
+                            " Coverage starts on day one.\n"
+                            "2. Claim Process\nSubmit receipts within 30 calendar days of the expense."},
+        {"page": 2, "text": f"{header}\nPage 2\n3. Dental Care\nDental checkups are covered twice a year."},
+    ]
+    chunks = _chunk(pages)
+    sections = [c["section"] for c in chunks]
+
+    assert header not in sections
+    assert sections == ["Benefits Guide", "1. Benefits at a Glance", "2. Claim Process", "3. Dental Care"]
+    assert all(header not in c["content"] and "Page 1" not in c["content"] for c in chunks)
+    glance = next(c for c in chunks if c["section"] == "1. Benefits at a Glance")
+    assert "- Coverage starts on day one." in glance["content"]
+    assert next(c for c in chunks if c["section"] == "3. Dental Care")["page"] == 2
+
+
+def test_strong_heading_ignores_sentences_and_numbers():
+    assert DocumentProcessor.is_strong_heading("8. Claim Process") is True
+    assert DocumentProcessor.is_strong_heading("EMPLOYEE BENEFITS") is True
+    assert DocumentProcessor.is_strong_heading("3% of wage: 2% employer + 1% employee") is False
+    assert DocumentProcessor.is_strong_heading("12 days of annual leave") is False
+    assert DocumentProcessor.is_strong_heading("1. Submit the request form before your first day.") is False
+    assert DocumentProcessor.is_strong_heading("Benefit Limit / Rule") is False
+
+
+def _chunk(pages):
+    return DocumentProcessor.chunk_document(DocumentProcessor.__new__(DocumentProcessor), pages)
