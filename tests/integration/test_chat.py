@@ -50,7 +50,7 @@ async def test_chat_validation_empty_message():
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
-        response = await client.post("/api/v1/chat", json={"message": ""})
+        response = await client.post("/api/v1/chat", headers={"X-User-Id": "user_001"}, json={"message": ""})
         assert response.status_code == 422
 
 

@@ -1,11 +1,14 @@
 """Intent classification for chat messages.
 
 Order of checks:
-1. The sensitive-question regex (fast, no network) blocks confidential requests.
-2. One short Gemini call with structured JSON output picks the intent. It handles
-   paraphrases and Indonesian that fixed English patterns miss.
+1. Regex rules (fast, no network): sensitive requests are blocked, and explicit
+   matches (out of scope, my tasks, onboarding actions, general onboarding) are used
+   as-is, skipping Gemini.
+2. Otherwise one short Gemini call with structured JSON output picks the intent. It
+   handles paraphrases and Indonesian that fixed patterns miss. The chat endpoint
+   runs it in parallel with the document search.
 3. If Gemini is disabled, fails, times out or returns something unexpected, the
-   regex router decides.
+   message is treated as a company-knowledge question.
 """
 
 import asyncio
@@ -81,9 +84,25 @@ class IntentClassifier:
         history: Optional[Sequence[ChatMessage]] = None,
     ) -> Tuple[IntentType, bool, str]:
         """Return (intent, is_allowed, refusal_reason)."""
-        if ScopeRouter.is_sensitive(message):
-            return IntentType.OUT_OF_SCOPE, False, ScopeRouter.SENSITIVE_REASON
+        fast = self.fast_route(message)
+        if fast is not None:
+            return fast
+        return await self.classify_slow(message, history)
 
+    @staticmethod
+    def fast_route(message: str) -> Optional[Tuple[IntentType, bool, str]]:
+        """Regex decision with no network call: sensitive, out of scope, my tasks, etc.
+
+        Returns None when no rule fired; the caller then needs `classify_slow`.
+        """
+        return ScopeRouter.match(message)
+
+    async def classify_slow(
+        self,
+        message: str,
+        history: Optional[Sequence[ChatMessage]] = None,
+    ) -> Tuple[IntentType, bool, str]:
+        """Gemini classification for messages the regex rules did not match."""
         if self.settings.intent_classifier_enabled:
             label = await self._classify_with_gemini(message, history)
             if label == SENSITIVE_LABEL:

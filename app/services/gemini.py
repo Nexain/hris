@@ -29,6 +29,8 @@ Strict Guidelines:
 numbers of the excerpts below. Cite only the sources you actually used.
 6. Earlier conversation turns are for understanding follow-up questions only; facts must still
 come from the excerpts.
+7. Answer in the same language as the employee's question (for example Indonesian or English),
+but always use the exact English fallback sentence from rule 2 when you cannot answer.
 """
 
 # Sources scoring below this share of the best match are dropped when the model does
@@ -97,6 +99,21 @@ class RAGEngine:
         self.vertex_service = vertex_service or get_vertex_service()
         self.settings = settings or get_settings()
 
+    async def retrieve(
+        self,
+        question: str,
+        history: Optional[Sequence[ChatMessage]] = None,
+        department: Optional[str] = None,
+        location: Optional[str] = None,
+    ) -> List[Tuple[DocumentChunk, float]]:
+        """Search published chunks for a question (with the previous turn for follow-ups)."""
+        return await self.retrieval_service.search(
+            query=build_retrieval_query(question, _trim_history(history)),
+            top_k=5,
+            department=department,
+            location=location,
+        )
+
     async def answer_question(
         self,
         question: str,
@@ -104,20 +121,18 @@ class RAGEngine:
         department: Optional[str] = None,
         location: Optional[str] = None,
         history: Optional[Sequence[ChatMessage]] = None,
+        scored_chunks: Optional[List[Tuple[DocumentChunk, float]]] = None,
     ) -> Tuple[str, List[Citation], bool, bool]:
         """
         Execute full RAG pipeline for a company knowledge question.
+        Pass `scored_chunks` from `retrieve` to reuse a search started earlier.
         Returns: (answer, citations, grounded, escalation_required)
         """
         history = _trim_history(history)
 
         # 1. Retrieve top-K chunks from published versions
-        scored_chunks = await self.retrieval_service.search(
-            query=build_retrieval_query(question, history),
-            top_k=5,
-            department=department,
-            location=location,
-        )
+        if scored_chunks is None:
+            scored_chunks = await self.retrieve(question, history, department, location)
 
         # 2. Safe Fallback if no relevant published context found
         if not scored_chunks:

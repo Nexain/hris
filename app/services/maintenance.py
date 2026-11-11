@@ -7,7 +7,7 @@ replaces; `/publish` and the reconcile job both use it.
 - several PUBLISHED versions of one document (keeps the newest),
 - older versions that never went live (e.g. stuck in PROCESSING),
 - `current_version_id` that does not point at the live version,
-- published chunks built by an older chunker (re-processes them; they stay live).
+- live and in-review chunks built by an older chunker (re-processes them; each keeps its status).
 """
 
 import logging
@@ -90,6 +90,7 @@ async def supersede_replaced_versions(
 
 class ReprocessResult(BaseModel):
     version_id: str
+    status: Optional[str] = None
     chunk_count: Optional[int] = None
     sections: List[str] = Field(default_factory=list)
     error: Optional[str] = None
@@ -198,20 +199,34 @@ class KnowledgeBaseReconciler:
                 )
             )
 
-        if live and reprocess:
-            result.reprocessed.append(await self._reprocess(live.id, dry_run))
+        if reprocess:
+            # Live version, plus drafts waiting for HR review, so reviewers see clean chunks.
+            # Re-processing keeps each version's status (PUBLISHED stays PUBLISHED, REVIEW stays REVIEW).
+            superseded_ids = {s["version_id"] for s in result.superseded}
+            targets = [live] if live else []
+            targets += sorted(
+                (v for v in versions if v.status == VersionStatus.REVIEW and v.id not in superseded_ids),
+                key=lambda v: v.created_at,
+            )
+            for version in targets:
+                result.reprocessed.append(await self._reprocess(version.id, version.status, dry_run))
         return result
 
-    async def _reprocess(self, version_id: str, dry_run: bool) -> ReprocessResult:
+    async def _reprocess(self, version_id: str, status: VersionStatus, dry_run: bool) -> ReprocessResult:
         if dry_run:
-            return ReprocessResult(version_id=version_id)
+            return ReprocessResult(version_id=version_id, status=status.value)
         try:
             processed = await self.processor.process_version(version_id)
         except Exception as e:  # keep going; one bad PDF must not stop the rest
             logger.error(f"Reconcile: re-processing '{version_id}' failed: {e}")
-            return ReprocessResult(version_id=version_id, error=str(e))
+            return ReprocessResult(version_id=version_id, status=status.value, error=str(e))
         sections: List[str] = []
         for chunk in processed.chunks:
             if chunk.section and chunk.section not in sections:
                 sections.append(chunk.section)
-        return ReprocessResult(version_id=version_id, chunk_count=processed.chunk_count, sections=sections)
+        return ReprocessResult(
+            version_id=version_id,
+            status=processed.status.value,
+            chunk_count=processed.chunk_count,
+            sections=sections,
+        )

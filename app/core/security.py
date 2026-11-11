@@ -5,7 +5,7 @@ from fastapi import Depends, Header
 from pydantic import BaseModel
 
 from app.core.config import Settings, get_settings
-from app.core.errors import UnauthorizedAccessException
+from app.core.errors import UnauthenticatedException, UnauthorizedAccessException
 
 
 class AccessLevel(str, Enum):
@@ -40,11 +40,17 @@ def get_current_user(
 ) -> UserContext:
     """Build the caller's context from request headers.
 
+    Trust boundary: ``X-User-Id`` is set by the frontend proxy from the signed
+    session cookie, and Cloud Run IAM only lets the frontend service call this
+    backend. A request without it is rejected (401); there is no default user.
+
     The access level is decided on the server from the HR admin allowlist. A client
     cannot raise its own privileges by sending ``X-Access-Level``; that header is
     ignored.
     """
-    user_id = (x_user_id or "user_001").strip()
+    user_id = (x_user_id or "").strip()
+    if not user_id:
+        raise UnauthenticatedException("Missing X-User-Id header.")
 
     if user_id in hr_admin_ids(settings):
         return UserContext(
@@ -64,6 +70,10 @@ def get_current_user(
         location=x_user_location or "Jakarta",
         access_level=AccessLevel.EMPLOYEE,
     )
+
+
+def is_hr_admin_id(user_id: str, settings: Settings) -> bool:
+    return user_id in hr_admin_ids(settings)
 
 
 def require_hr_admin(current_user: UserContext = Depends(get_current_user)) -> UserContext:

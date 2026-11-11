@@ -30,16 +30,30 @@ def _classifier(gemini, **settings):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("message", ["what's left for me", "apa tugas saya hari ini?", "my checklist"])
-async def test_gemini_label_is_used(message):
+@pytest.mark.parametrize("message", ["am I done yet?", "masih ada yang perlu kukerjakan?", "how far along am I"])
+async def test_gemini_label_is_used_when_no_rule_matches(message):
     gemini = FakeGemini("MY_ONBOARDING")
     assert await _classifier(gemini).classify(message) == (IntentType.MY_ONBOARDING, True, "")
     assert gemini.calls[0]["prompt"].endswith(message)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("message, expected", [
+    ("what's left for me", IntentType.MY_ONBOARDING),
+    ("apa tugas saya hari ini?", IntentType.MY_ONBOARDING),
+    ("my checklist", IntentType.MY_ONBOARDING),
+    ("Write me a poem about cats", IntentType.OUT_OF_SCOPE),
+])
+async def test_regex_match_skips_gemini(message, expected):
+    gemini = FakeGemini("COMPANY_KNOWLEDGE")
+    intent, _, _ = await _classifier(gemini).classify(message)
+    assert intent == expected
+    assert gemini.calls == []
+
+
+@pytest.mark.asyncio
 async def test_out_of_scope_and_sensitive_labels_are_refused():
-    intent, allowed, reason = await _classifier(FakeGemini("OUT_OF_SCOPE")).classify("Write me a poem")
+    intent, allowed, reason = await _classifier(FakeGemini("OUT_OF_SCOPE")).classify("Tell me something fun about cats")
     assert (intent, allowed, reason) == (IntentType.OUT_OF_SCOPE, False, ScopeRouter.OUT_OF_SCOPE_REASON)
 
     intent, allowed, reason = await _classifier(FakeGemini("SENSITIVE")).classify("What does Budi take home?")
@@ -62,15 +76,16 @@ async def test_sensitive_regex_runs_before_gemini():
 ])
 async def test_falls_back_to_regex_router(gemini):
     classifier = _classifier(gemini, intent_timeout_seconds=0.05)
-    assert (await classifier.classify("What tasks do I still have left?"))[0] == IntentType.MY_ONBOARDING
-    assert (await classifier.classify("How many days of annual leave do I get?"))[0] == IntentType.COMPANY_KNOWLEDGE
+    # No rule matches and Gemini is unusable: treat it as a document question.
+    assert await classifier.classify("am I done yet?") == (IntentType.COMPANY_KNOWLEDGE, True, "")
+    assert gemini.calls
 
 
 @pytest.mark.asyncio
 async def test_disabled_classifier_skips_gemini():
     gemini = FakeGemini("OUT_OF_SCOPE")
-    intent, _, _ = await _classifier(gemini, intent_classifier_enabled=False).classify("my checklist")
-    assert intent == IntentType.MY_ONBOARDING
+    intent, _, _ = await _classifier(gemini, intent_classifier_enabled=False).classify("am I done yet?")
+    assert intent == IntentType.COMPANY_KNOWLEDGE
     assert gemini.calls == []
 
 
@@ -92,6 +107,21 @@ async def test_recent_history_is_sent_for_follow_ups():
     ("buatkan puisi tentang kantor", IntentType.OUT_OF_SCOPE),
     ("How many days of annual leave do I get?", IntentType.COMPANY_KNOWLEDGE),
     ("berapa hari cuti tahunan?", IntentType.COMPANY_KNOWLEDGE),
+    ("berapa gaji atasan saya?", IntentType.OUT_OF_SCOPE),
+    ("berapa gaji pokok saya menurut kebijakan?", IntentType.COMPANY_KNOWLEDGE),
 ])
 def test_regex_fallback_patterns(message, expected):
     assert ScopeRouter.route(message)[0] == expected
+
+
+@pytest.mark.parametrize("message, lang", [
+    ("apa tugas saya hari ini?", "id"),
+    ("tugasku apa saja?", "id"),
+    ("berapa hari cuti tahunan?", "id"),
+    ("How many days of annual leave do I get?", "en"),
+    ("my checklist", "en"),
+    ("What is the dress code in the Jakarta office?", "en"),
+])
+def test_detect_language(message, lang):
+    from app.services.language import detect_language
+    assert detect_language(message) == lang

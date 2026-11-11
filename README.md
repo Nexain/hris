@@ -217,11 +217,19 @@ are used:
 }
 ```
 
-**Intent routing.** A regex check blocks sensitive questions first (other people's
-pay, private HR records). Then one short Gemini call with structured output picks the
-intent, so paraphrases and Indonesian work ("what's left for me", "apa tugas saya hari
-ini?"). If that call fails or takes longer than `INTENT_TIMEOUT_SECONDS`, the regex
-router decides. Questions about the user's own onboarding list every pending task.
+**Intent routing.** Regex rules decide first, with no network call: sensitive
+questions (other people's pay, private HR records, in English and Indonesian) are
+refused, and clear matches such as "my checklist", "what's left for me", "apa tugas
+saya hari ini?" or "write me a poem" are routed directly. Other messages get one
+short Gemini call with structured output, which runs **in parallel with the document
+search**; the search result is used if the message is a company question. If the
+Gemini call fails or takes longer than `INTENT_TIMEOUT_SECONDS`, the message is
+treated as a company question. Questions about the user's own onboarding list every
+pending task.
+
+**Language.** Fixed answers (task list, refusals, "no information" fallback) follow
+the question's language: Indonesian or English. Document answers from Gemini are
+asked to do the same.
 
 **No raw Gemini access.** Requests with `stream`, `system_instruction`, `model`,
 `temperature` or `max_output_tokens` get 403 unless `ENABLE_RAW_GEMINI_BRIDGE=true`
@@ -277,8 +285,16 @@ published.
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/admin/knowledge-base/reconcile` | Repair lifecycle data: keep the newest published version live, supersede older versions that never went live, fix `current_version_id`, and re-process live versions. `?dry_run=true` (default) only reports; `?reprocess=false` skips re-processing. |
+| `POST` | `/admin/knowledge-base/reconcile` | Repair lifecycle data: keep the newest published version live, supersede older versions that never went live, fix `current_version_id`, and re-process live versions and drafts in review. `?dry_run=true` (default) only reports; `?reprocess=false` skips re-processing. |
 
+| `GET` | `/admin/employees` | Every employee profile with `progress_percent`, `completed`, `total` (HR monitor) |
+| `GET` | `/admin/employees/{user_id}/tasks` | An employee's tasks, read-only |
+| `GET` | `/admin/employees/{user_id}/progress` | An employee's progress |
+
+All admin endpoints return 403 for non-HR users. HR cannot complete tasks for an
+employee; `POST /tasks/{id}/complete` only works for the task's owner.
+
+Reconcile re-processes live versions and drafts in `REVIEW`; each keeps its status.
 Run it once after a deploy that changes chunking or lifecycle rules:
 
 ```bash
@@ -287,6 +303,9 @@ curl -X POST "$API/api/v1/admin/knowledge-base/reconcile?dry_run=false" -H "X-Us
 ```
 
 ### Onboarding
+
+`GET /profile` includes `is_hr` (from `HR_ADMIN_USER_IDS`). HR admins without a
+stored profile get a default HR profile instead of 404.
 
 | Method | Path | Description |
 |---|---|---|
@@ -346,9 +365,21 @@ Employees may access published company documentation, their own profile, and
 their own tasks. Sensitive requests (e.g. another person's salary) are rejected
 and flagged for escalation.
 
-> **Limitation:** `X-User-Id` is still trusted as sent. The backend must only be
-> reachable through the frontend proxy, and that proxy should set `X-User-Id`
-> from an authenticated session rather than from the browser.
+### Trust boundary
+
+The backend trusts `X-User-Id`, so it must never be reachable except through the
+frontend:
+
+1. **Who can call the backend:** the Cloud Run service requires IAM authentication.
+   Only the frontend's service account has `roles/run.invoker`; direct calls get 403
+   from Cloud Run before reaching FastAPI. Keep it that way (no `allUsers` invoker).
+2. **Who sets `X-User-Id`:** the frontend proxy (`hris-fe`,
+   `src/app/api/proxy/[...path]/route.ts`) reads the signed session cookie and always
+   sets `X-User-Id` from it. It drops any `X-User-Id` / `X-Access-Level` the browser
+   sends, and returns 401 without a valid session.
+3. **What the backend decides:** HR rights come only from `HR_ADMIN_USER_IDS`.
+   `X-Access-Level` is ignored. A request without `X-User-Id` gets
+   **401 `UNAUTHENTICATED`**; there is no default user.
 
 ---
 

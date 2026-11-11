@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from typing import Any, Dict, List, Optional, Union
@@ -11,14 +12,27 @@ from app.core.security import UserContext, get_current_user
 from app.models.chat import ChatRequestV1, ChatResponseV1, IntentType
 from app.models.onboarding import TaskStatus
 from app.schemas.chat import ChatMessage
-from app.services.gemini import RAGEngine, get_rag_engine
+from app.services.gemini import FALLBACK_MESSAGE, RAGEngine, get_rag_engine
 from app.services.intent import IntentClassifier, get_intent_classifier
+from app.services.language import detect_language, onboarding_status_answer
+from app.services.language import text as localized
+from app.services.router import ScopeRouter
 from app.services.onboarding import OnboardingService, get_onboarding_service
 from app.services.vertex_service import VertexGeminiService, get_vertex_service
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Chat"])
+
+_REFUSAL_KEYS = {
+    ScopeRouter.SENSITIVE_REASON: "sensitive",
+    ScopeRouter.OUT_OF_SCOPE_REASON: "out_of_scope",
+}
+
+
+def _localize_refusal(reason: str, lang: str) -> str:
+    key = _REFUSAL_KEYS.get(reason)
+    return localized(lang, key) if key else reason
 
 # Fields that ask for the raw, ungrounded Gemini bridge instead of grounded chat.
 BRIDGE_FIELDS = ("stream", "system_instruction", "model", "temperature", "max_output_tokens")
@@ -114,12 +128,43 @@ async def chat_endpoint(
 
     history = _parse_history(body.get("history"))
 
-    # 1. Scope Gate & Intent Routing (Phase 5): sensitive regex, then Gemini, then regex fallback.
-    intent, is_allowed, fallback_reason = await intent_classifier.classify(message, history)
+    lang = detect_language(message)
+
+    # Users without an onboarding profile (e.g. HR admins testing policies) can still
+    # ask company questions; fall back to the department/location from the request.
+    async def search_documents():
+        try:
+            profile = await onboarding_service.get_profile(user_id)
+            department, location = profile.department, profile.location
+        except ResourceNotFoundException:
+            department, location = current_user.department, current_user.location
+        return department, location, await rag_engine.retrieve(message, history, department, location)
+
+    # 1. Scope Gate & Intent Routing (Phase 5).
+    # Regex rules decide first with no network call. Otherwise the Gemini intent call
+    # and the document search run at the same time, and the search result is used if
+    # the message turns out to be a company-knowledge question.
+    search_task: Optional[asyncio.Task] = None
+    routed = intent_classifier.fast_route(message)
+    if routed is None:
+        classify_task = asyncio.create_task(intent_classifier.classify_slow(message, history))
+        await asyncio.sleep(0)  # let the Gemini request go out before the search starts
+        search_task = asyncio.create_task(search_documents())
+        # If the search is not used, still collect its exception so asyncio doesn't log it.
+        search_task.add_done_callback(lambda t: t.cancelled() or t.exception())
+        try:
+            routed = await classify_task
+        except BaseException:
+            search_task.cancel()
+            raise
+    intent, is_allowed, fallback_reason = routed
+
+    if intent != IntentType.COMPANY_KNOWLEDGE and search_task is not None:
+        search_task.cancel()
 
     if not is_allowed:
         return ChatResponseV1(
-            answer=fallback_reason,
+            answer=_localize_refusal(fallback_reason, lang),
             citations=[],
             intent=intent,
             grounded=False,
@@ -140,28 +185,12 @@ async def chat_endpoint(
         pending = [t for t in tasks if t.status == TaskStatus.PENDING]
 
         if progress is None:
-            answer = "You don't have an onboarding profile yet, so there are no onboarding tasks to show."
-        elif not tasks:
-            answer = "You currently have no onboarding tasks assigned."
-        elif not pending:
-            answer = f"Congratulations! You have completed all {progress.total} onboarding tasks (100% complete)!"
+            answer = localized(lang, "no_profile")
         else:
-            pending.sort(key=lambda t: (t.day, t.id))
-            next_task = pending[0]
-            task_lines = "\n".join(f"- Day {t.day}: {t.title}" for t in pending)
-            answer = (
-                f"You have completed {progress.completed} of {progress.total} tasks "
-                f"({progress.progress_percent}% complete). "
-                f"You still have {len(pending)} task{'s' if len(pending) != 1 else ''} left:\n\n"
-                f"{task_lines}\n\n"
-                f"Next up: **{next_task.title}** (Day {next_task.day}). {next_task.description}"
-            )
+            answer = onboarding_status_answer(lang, tasks, pending, progress)
 
         if intent == IntentType.GENERAL_ONBOARDING:
-            answer = (
-                "Your onboarding program walks you through company policies and your first-week tasks. "
-                + answer
-            )
+            answer = localized(lang, "general_intro") + answer
 
         return ChatResponseV1(
             answer=answer,
@@ -172,13 +201,9 @@ async def chat_endpoint(
         )
 
     # 3. Handle COMPANY_KNOWLEDGE via RAG (Phase 3)
-    # Users without an onboarding profile (e.g. HR admins testing policies) can still
-    # ask company questions; fall back to the department/location from the request.
-    try:
-        profile = await onboarding_service.get_profile(user_id)
-        department, location = profile.department, profile.location
-    except ResourceNotFoundException:
-        department, location = current_user.department, current_user.location
+    if search_task is None:
+        search_task = asyncio.create_task(search_documents())
+    department, location, scored_chunks = await search_task
 
     answer, citations, grounded, escalation_required = await rag_engine.answer_question(
         question=message,
@@ -186,7 +211,10 @@ async def chat_endpoint(
         department=department,
         location=location,
         history=history,
+        scored_chunks=scored_chunks,
     )
+    if answer == FALLBACK_MESSAGE:
+        answer = localized(lang, "fallback")
 
     return ChatResponseV1(
         answer=answer,

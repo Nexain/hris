@@ -8,6 +8,7 @@ from app.core.errors import (
     UnauthorizedAccessException,
 )
 from app.models.onboarding import (
+    EmployeeSummary,
     OnboardingProgress,
     OnboardingTask,
     TaskStatus,
@@ -207,7 +208,33 @@ class OnboardingService:
 
     async def get_progress(self, user_id: str) -> OnboardingProgress:
         """Calculate onboarding completion progress from persisted task states."""
-        tasks = await self.get_tasks(user_id)
+        return self._progress(await self.get_tasks(user_id))
+
+    async def list_employee_summaries(self, exclude_user_ids: Optional[set] = None) -> List[EmployeeSummary]:
+        """Every stored profile with its onboarding progress, sorted by name (HR monitor)."""
+        exclude_user_ids = exclude_user_ids or set()
+        summaries: List[EmployeeSummary] = []
+        for profile in await self.firestore_repo.list_users():
+            if profile.user_id in exclude_user_ids:
+                continue
+            progress = self._progress(await self.firestore_repo.get_tasks(profile.user_id))
+            summaries.append(
+                EmployeeSummary(
+                    user_id=profile.user_id,
+                    name=profile.name,
+                    role=profile.role,
+                    department=profile.department,
+                    location=profile.location,
+                    progress_percent=progress.progress_percent,
+                    completed=progress.completed,
+                    total=progress.total,
+                )
+            )
+        summaries.sort(key=lambda e: (e.name.lower(), e.user_id))
+        return summaries
+
+    @staticmethod
+    def _progress(tasks: List[OnboardingTask]) -> OnboardingProgress:
         total = len(tasks)
         completed = sum(1 for t in tasks if t.status == TaskStatus.COMPLETED)
         remaining = total - completed

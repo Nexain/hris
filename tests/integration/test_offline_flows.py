@@ -6,6 +6,9 @@ lexical embeddings, and a stubbed Vertex client that forces the RAG engine's
 deterministic extractive answer path.
 """
 
+import asyncio
+import time
+
 import httpx
 import pytest
 
@@ -365,7 +368,7 @@ async def test_list_and_filter_documents(api):
         filtered = (await client.get("/api/v1/documents?location=Jakarta", headers=HR)).json()
         assert all(d["location"] == "Jakarta" for d in filtered)
 
-        published = (await client.get("/api/v1/documents?status=PUBLISHED")).json()
+        published = (await client.get("/api/v1/documents?status=PUBLISHED", headers=EMP)).json()
         assert any(d["id"] == "handbook" for d in published)
 
 
@@ -519,8 +522,12 @@ async def test_reprocessing_published_version_keeps_it_live(api):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("question", ["what's left for me", "apa tugas saya hari ini?", "my checklist"])
-async def test_my_tasks_question_lists_pending_tasks(api, question):
+@pytest.mark.parametrize("question, left_text, line", [
+    ("what's left for me", "You still have 6 tasks left", "- Day {day}: {title}"),
+    ("my checklist", "You still have 6 tasks left", "- Day {day}: {title}"),
+    ("apa tugas saya hari ini?", "Masih ada 6 tugas tersisa", "- Hari {day}: {title}"),
+])
+async def test_my_tasks_question_lists_pending_tasks(api, question, left_text, line):
     async with _client() as client:
         await _create_profile(client)
         tasks = (await client.get("/api/v1/tasks", headers=EMP)).json()
@@ -529,10 +536,83 @@ async def test_my_tasks_question_lists_pending_tasks(api, question):
         res = await client.post("/api/v1/chat", headers=EMP, json={"user_id": "user_001", "message": question})
         body = res.json()
         assert body["intent"] == "MY_ONBOARDING", body
-        assert "You still have 6 tasks left" in body["answer"]
+        assert left_text in body["answer"]
         for task in tasks[1:]:
-            assert f"- Day {task['day']}: {task['title']}" in body["answer"]
+            assert line.format(day=task["day"], title=task["title"]) in body["answer"]
         assert tasks[0]["title"] not in body["answer"]
+
+
+@pytest.mark.asyncio
+async def test_indonesian_refusals_and_fallback(api):
+    async with _client() as client:
+        res = await client.post("/api/v1/chat", headers=EMP, json={"message": "buatkan puisi tentang kucing dong"})
+        assert res.json()["intent"] == "OUT_OF_SCOPE"
+        assert res.json()["answer"].startswith("Saya DayOne AI")
+
+        res = await client.post("/api/v1/chat", headers=EMP, json={"message": "berapa gaji manajer saya?"})
+        assert res.json()["intent"] == "OUT_OF_SCOPE"
+        assert res.json()["answer"].startswith("Saya tidak dapat mengakses catatan HR")
+
+        # No documents yet, so a policy question gets the Indonesian fallback.
+        res = await client.post("/api/v1/chat", headers=EMP, json={"message": "berapa hari cuti tahunan saya?"})
+        assert res.json()["answer"].startswith("Saya tidak menemukan informasi")
+
+        res = await client.post("/api/v1/chat", headers=EMP, json={"message": "What is the salary of my manager?"})
+        assert res.json()["answer"] == "I cannot access confidential HR records or personal employee salary information."
+
+
+class SlowClassifierVertex:
+    """Gemini fake: the intent call takes 0.2s and says COMPANY_KNOWLEDGE; answers cite Source 1."""
+
+    def __init__(self, label="COMPANY_KNOWLEDGE"):
+        self.label = label
+
+    async def generate_json(self, **kwargs):
+        await asyncio.sleep(0.2)
+        return {"intent": self.label}
+
+    async def generate_chat(self, request):  # noqa: ANN001
+        from app.schemas.chat import ChatResponse
+        return ChatResponse(response="Twelve days [Source 1].", model="fake")
+
+
+class SlowEmbeddings(EmbeddingService):
+    async def get_embedding(self, text):
+        await asyncio.sleep(0.2)
+        return await super().get_embedding(text)
+
+
+@pytest.mark.asyncio
+async def test_intent_call_and_document_search_run_in_parallel(api, tmp_path):
+    from app.services.intent import get_intent_classifier, IntentClassifier
+
+    vertex = SlowClassifierVertex()
+    slow_retrieval = RetrievalService(firestore_repo=api["firestore"], embedding_service=SlowEmbeddings(settings=Settings()))
+    app.dependency_overrides[get_rag_engine] = lambda: RAGEngine(retrieval_service=slow_retrieval, vertex_service=vertex)
+    app.dependency_overrides[get_intent_classifier] = lambda: IntentClassifier(vertex_service=vertex, settings=Settings())
+    async with _client() as client:
+        await _ingest(client, "Leave Policy", ["1. Annual Leave\nEmployees receive twelve days of annual leave."])
+
+        started = time.perf_counter()
+        res = await client.post("/api/v1/chat", headers=EMP, json={"message": "How much annual leave is there?"})
+        elapsed = time.perf_counter() - started
+
+        body = res.json()
+        assert body["grounded"] is True and body["answer"] == "Twelve days."
+        # Sequential would be >= 0.4s (0.2s intent + 0.2s embedding).
+        assert elapsed < 0.35, elapsed
+
+
+@pytest.mark.asyncio
+async def test_search_result_is_discarded_for_non_document_intents(api):
+    from app.services.intent import get_intent_classifier, IntentClassifier
+
+    vertex = SlowClassifierVertex(label="OUT_OF_SCOPE")
+    app.dependency_overrides[get_intent_classifier] = lambda: IntentClassifier(vertex_service=vertex, settings=Settings())
+    async with _client() as client:
+        res = await client.post("/api/v1/chat", headers=EMP, json={"message": "Tell me something fun about cats"})
+        assert res.json()["intent"] == "OUT_OF_SCOPE"
+        assert res.json()["citations"] == []
 
 
 # ---------------------------------------------------------------- reconcile
@@ -611,3 +691,32 @@ async def test_reconcile_repairs_legacy_lifecycle_data(api):
         again = (await client.post(
             "/api/v1/admin/knowledge-base/reconcile?dry_run=false&reprocess=false", headers=HR)).json()
         assert again["documents_changed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_reconcile_reprocesses_drafts_in_review(api):
+    firestore = api["firestore"]
+    header = "DayOne AI - Internal HR Knowledge Base Prototype"
+    async with _client() as client:
+        doc_id, draft = await _ingest(client, "Code of Conduct", [
+            f"{header}\nPage 1\n1. Respectful Workplace\nTreat colleagues with dignity.",
+            f"{header}\nPage 2\n2. Conflicts of Interest\nDisclose outside business interests.",
+        ], publish=False)
+        for chunk in await firestore.get_chunks_by_version(draft):
+            chunk.section = header
+            chunk.content = f"Page 1\n{chunk.content}"
+            await firestore.save_chunks([chunk])
+
+        dry = (await client.post("/api/v1/admin/knowledge-base/reconcile", headers=HR)).json()
+        doc_report = next(d for d in dry["documents"] if d["document_id"] == doc_id)
+        assert doc_report["reprocessed"] == [
+            {"version_id": draft, "status": "REVIEW", "chunk_count": None, "sections": [], "error": None}]
+
+        report = (await client.post("/api/v1/admin/knowledge-base/reconcile?dry_run=false", headers=HR)).json()
+        doc_report = next(d for d in report["documents"] if d["document_id"] == doc_id)
+        assert doc_report["reprocessed"][0]["status"] == "REVIEW"
+        assert doc_report["reprocessed"][0]["sections"] == ["1. Respectful Workplace", "2. Conflicts of Interest"]
+
+        assert (await firestore.get_document_version(draft)).status == VersionStatus.REVIEW
+        chunks = await firestore.get_chunks_by_version(draft)
+        assert all("Page 1" not in c.content and c.section != header for c in chunks)

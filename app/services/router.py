@@ -1,5 +1,5 @@
 import re
-from typing import Tuple
+from typing import Optional, Tuple
 
 from app.models.chat import IntentType
 
@@ -13,6 +13,9 @@ class ScopeRouter:
         r"\b(salary|compensation|wage|wages|earnings?|payslip|pay\s?slip)\s+(of|for)\b",
         r"\b(colleague|coworker|co-worker|teammate|employee|manager|someone|he|she|they)\b"
         r".{0,40}\b(salary|earn|earns|make|makes|paid|compensation|wage|wages)\b",
+        # Indonesian: someone else's pay ("gaji manajer saya", "berapa gaji rekan kerja").
+        r"\b(gaji|upah|penghasilan|bayaran)\b.{0,30}\b(manager|manajer|atasan|bos|rekan|teman|kolega|"
+        r"karyawan\s+lain|orang\s+lain|dia|mereka|direktur|ceo)\b",
         # Private HR records / actions.
         r"\b(private|confidential)\s+hr\s+record",
         r"\bperformance\s+review\s+of\b",
@@ -65,10 +68,10 @@ class ScopeRouter:
         return any(re.search(pat, msg_lower) for pat in cls.SENSITIVE_PATTERNS)
 
     @classmethod
-    def route(cls, message: str) -> Tuple[IntentType, bool, str]:
-        """
-        Route message to intent.
-        Returns: (intent, is_allowed, fallback_or_reason)
+    def match(cls, message: str) -> Optional[Tuple[IntentType, bool, str]]:
+        """Return the routing decision when an explicit pattern matches, else None.
+
+        None means "no rule fired"; `route` then defaults to COMPANY_KNOWLEDGE.
         """
         msg_lower = message.strip().lower()
 
@@ -96,5 +99,13 @@ class ScopeRouter:
             if re.search(pat, msg_lower):
                 return (IntentType.GENERAL_ONBOARDING, True, "")
 
+        return None
+
+    @classmethod
+    def route(cls, message: str) -> Tuple[IntentType, bool, str]:
+        """
+        Route message to intent.
+        Returns: (intent, is_allowed, fallback_or_reason)
+        """
         # 6. Default to Company Knowledge (RAG)
-        return (IntentType.COMPANY_KNOWLEDGE, True, "")
+        return cls.match(message) or (IntentType.COMPANY_KNOWLEDGE, True, "")
