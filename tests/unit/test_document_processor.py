@@ -212,3 +212,26 @@ def test_strong_heading_ignores_sentences_and_numbers():
 
 def _chunk(pages):
     return DocumentProcessor.chunk_document(DocumentProcessor.__new__(DocumentProcessor), pages)
+
+
+def test_table_header_cells_are_not_sections():
+    """Header rows of tables ("Item", "Person / Role") must not replace the real heading."""
+    pages = [
+        {"page": 1, "text": "First Day Guide\nWelcome to the company.\n"
+                            "4. Who You'll Meet\nPerson / Role\nWhat to Discuss\nManager\nRole expectations"},
+        {"page": 2, "text": "Item\nBenefit Limit / Rule\nICU\nUp to Rp3,000,000 per day\n"
+                            "\x7f Submit receipts within 30 days.\n5. End-of-Day Checklist\nLog out of all systems."},
+    ]
+    chunks = _chunk(pages)
+    sections = [c["section"] for c in chunks]
+    assert sections == ["First Day Guide", "4. Who You'll Meet", "5. End-of-Day Checklist"]
+    meet = chunks[1]["content"]
+    assert meet.startswith("Person / Role\nWhat to Discuss")
+    assert "Item\nBenefit Limit / Rule" in meet
+    assert "- Submit receipts within 30 days." in meet
+
+
+def test_loose_heading_rules():
+    assert DocumentProcessor.is_likely_heading("Benefits Guide") is True
+    assert DocumentProcessor.is_likely_heading("Item") is False
+    assert DocumentProcessor.is_likely_heading("Person / Role") is False

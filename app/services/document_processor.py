@@ -120,9 +120,11 @@ class DocumentProcessor:
         if len(letters) >= 4 and line.isupper() and len(line) < 60:
             return True
 
-        # Title Case short line without ending punctuation
+        # Title Case short line without ending punctuation. Single words ("Item", "Area")
+        # and slashed labels ("Person / Role") are usually table header cells, not headings.
         if (
-            len(line.split()) <= 8
+            2 <= len(line.split()) <= 8
+            and "/" not in line
             and not line.endswith((".", ",", ";", ":", "-"))
             and line[0].isupper()
             and all(w[0].isupper() for w in line.split() if len(w) > 3)
@@ -132,7 +134,8 @@ class DocumentProcessor:
         return False
 
     # Private-use glyphs that PDF exports often use for bullets (Symbol/Wingdings fonts).
-    _BULLET_GLYPHS = re.compile(r"^[•●▪‣⁃]\s*")
+    # Also DEL (U+007F): pypdf emits it for some Symbol-font bullets.
+    _BULLET_GLYPHS = re.compile(r"^[\x7f•●▪‣⁃]\s*")
     _PAGE_NUMBER_LINE = re.compile(r"^(page\s+)?\d+(\s*(/|of)\s*\d+)?$", re.IGNORECASE)
     _NUMBERED_HEADING = re.compile(r"^\d+(\.\d+)*\.?\s+[A-Z][^\n]*$")
 
@@ -200,9 +203,29 @@ class DocumentProcessor:
         # 1. Segment text into structured blocks with current heading
         blocks: List[Dict[str, Any]] = []
         current_section = "General"
+        # A loose (title-case) heading must not replace a clear heading that has no text
+        # yet, e.g. "4. Who You'll Meet" followed by a table whose header row looks like
+        # a title.
+        section_is_strong = False
+        section_has_text = False
 
         def heading_text(line: str) -> str:
             return re.sub(r"^#+\s*", "", line).strip()
+
+        def take_heading(line: str) -> bool:
+            nonlocal current_section, section_is_strong, section_has_text
+            strong = self.is_strong_heading(line)
+            if not strong and section_is_strong and not section_has_text:
+                return False
+            current_section = heading_text(line)
+            section_is_strong = strong
+            section_has_text = False
+            return True
+
+        def add_block(text: str, page_num: int) -> None:
+            nonlocal section_has_text
+            blocks.append({"section": current_section, "page": page_num, "text": text})
+            section_has_text = True
 
         for p in pages:
             page_num = p["page"]
@@ -215,13 +238,11 @@ class DocumentProcessor:
 
                 # Check if paragraph is heading
                 lines = para.split("\n")
-                if len(lines) == 1 and self.is_likely_heading(lines[0]):
-                    current_section = heading_text(lines[0])
+                if len(lines) == 1 and self.is_likely_heading(lines[0]) and take_heading(lines[0]):
                     continue
 
                 # Check if first line of paragraph is heading
-                if len(lines) > 1 and self.is_likely_heading(lines[0]):
-                    current_section = heading_text(lines[0])
+                if len(lines) > 1 and self.is_likely_heading(lines[0]) and take_heading(lines[0]):
                     lines = lines[1:]
 
                 # Split the rest of the paragraph at clear headings inside it.
@@ -230,15 +251,15 @@ class DocumentProcessor:
                     if self.is_strong_heading(line):
                         text = "\n".join(buffer).strip()
                         if text:
-                            blocks.append({"section": current_section, "page": page_num, "text": text})
+                            add_block(text, page_num)
                         buffer = []
-                        current_section = heading_text(line)
+                        take_heading(line)
                     else:
                         buffer.append(line)
 
                 text = "\n".join(buffer).strip()
                 if text:
-                    blocks.append({"section": current_section, "page": page_num, "text": text})
+                    add_block(text, page_num)
 
         if not blocks:
             return []
